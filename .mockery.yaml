@@ -15,3 +15,12 @@ packages:
         config:
           filename: mock_id_generator.go
           structname: MockIDGenerator
+  github.com/edocsss/agent-whiteboard/internal/whiteboard:
+    config:
+      dir: "{{.InterfaceDir}}/mocks"
+      pkgname: mocks
+    interfaces:
+      Store:
+        config:
+          filename: mock_store.go
+          structname: MockStore
