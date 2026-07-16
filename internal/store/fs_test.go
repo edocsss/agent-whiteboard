@@ -279,6 +279,144 @@ func TestFSReplaceCommitsNewGenerationAndDeleteRemovesResource(t *testing.T) {
 	assertCodeWithoutRoot(t, err, common.CodeNotFound, root)
 }
 
+func TestFSDirectoryEntriesAreSyncedInCrashConsistentOrder(t *testing.T) {
+	root := t.TempDir()
+	fs := newTestFS(t, root)
+	original := imageDomain.Image{
+		ID: testID, Extension: ".png", MediaType: "image/png", Content: []byte("old"),
+		CreatedAt: time.Unix(1, 0), UpdatedAt: time.Unix(1, 0),
+	}
+	replacement := imageDomain.Image{
+		ID: testID, Extension: ".jpg", MediaType: "image/jpeg", Content: []byte("new"),
+		CreatedAt: time.Unix(2, 0), UpdatedAt: time.Unix(2, 0),
+	}
+
+	var events []string
+	oldGeneration := ""
+	fs.directorySync = func(directory *os.Root) error {
+		category := fs.categories["images"]
+		if directory == category {
+			if _, err := category.Lstat(testID); err == nil {
+				events = append(events, "resource-directory-created")
+			} else if errors.Is(err, os.ErrNotExist) {
+				events = append(events, "resource-directory-removed")
+			} else {
+				return err
+			}
+			return nil
+		}
+
+		stored, err := readMetadataForTest(directory)
+		if errors.Is(err, os.ErrNotExist) {
+			events = append(events, "generation-published")
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if oldGeneration == "" {
+			events = append(events, "metadata-published")
+		} else if stored.ContentFilename == oldGeneration {
+			events = append(events, "generation-published")
+		} else if _, err := directory.Lstat(oldGeneration); errors.Is(err, os.ErrNotExist) {
+			events = append(events, "old-generation-removed")
+		} else if err == nil {
+			events = append(events, "metadata-published")
+		} else {
+			return err
+		}
+		return nil
+	}
+
+	require.NoError(t, fs.Images().Create(context.Background(), original))
+	require.Equal(t, []string{
+		"resource-directory-created",
+		"generation-published",
+		"metadata-published",
+	}, events)
+	oldGeneration = decodeMetadata(t, filepath.Join(root, "images", testID, metadataFilename))["content_filename"].(string)
+
+	events = nil
+	require.NoError(t, fs.Images().Replace(context.Background(), replacement))
+	require.Equal(t, []string{
+		"generation-published",
+		"metadata-published",
+		"old-generation-removed",
+	}, events)
+
+	events = nil
+	require.NoError(t, fs.Images().Delete(context.Background(), testID))
+	require.Equal(t, []string{"resource-directory-removed"}, events)
+}
+
+func TestFSMetadataDirectorySyncFailurePreservesPublishedRecord(t *testing.T) {
+	tests := []struct {
+		name      string
+		prepare   func(*testing.T, *FS)
+		operation func(*FS) error
+		want      []byte
+	}{
+		{
+			name:    "create",
+			prepare: func(*testing.T, *FS) {},
+			operation: func(fs *FS) error {
+				return fs.Whiteboards().Create(context.Background(), whiteboardDomain.Whiteboard{
+					ID: testID, Kind: whiteboardDomain.KindMarkdown, Source: []byte("created"),
+					CreatedAt: time.Unix(1, 0), UpdatedAt: time.Unix(1, 0),
+				})
+			},
+			want: []byte("created"),
+		},
+		{
+			name: "replace",
+			prepare: func(t *testing.T, fs *FS) {
+				require.NoError(t, fs.Whiteboards().Create(context.Background(), whiteboardDomain.Whiteboard{
+					ID: testID, Kind: whiteboardDomain.KindMarkdown, Source: []byte("old"),
+					CreatedAt: time.Unix(1, 0), UpdatedAt: time.Unix(1, 0),
+				}))
+			},
+			operation: func(fs *FS) error {
+				return fs.Whiteboards().Replace(context.Background(), whiteboardDomain.Whiteboard{
+					ID: testID, Kind: whiteboardDomain.KindHTML, Source: []byte("replaced"),
+					CreatedAt: time.Unix(2, 0), UpdatedAt: time.Unix(2, 0),
+				})
+			},
+			want: []byte("replaced"),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			root := t.TempDir()
+			fs := newTestFS(t, root)
+			tt.prepare(t, fs)
+			syncFailure := errors.New("injected metadata directory sync failure")
+			resourceSyncs := 0
+			fs.directorySync = func(directory *os.Root) error {
+				if directory == fs.categories["whiteboards"] {
+					return nil
+				}
+				resourceSyncs++
+				if resourceSyncs == 2 {
+					return syncFailure
+				}
+				return nil
+			}
+
+			err := tt.operation(fs)
+			assertCodeWithoutRoot(t, err, common.CodeStorageUnavailable, root)
+			require.ErrorIs(t, err, syncFailure)
+			fs.directorySync = func(*os.Root) error { return nil }
+
+			got, err := fs.Whiteboards().Get(context.Background(), testID)
+			require.NoError(t, err)
+			require.Equal(t, tt.want, got.Source)
+			stored := decodeMetadata(t, filepath.Join(root, "whiteboards", testID, metadataFilename))
+			require.FileExists(t, filepath.Join(root, "whiteboards", testID, stored["content_filename"].(string)))
+		})
+	}
+}
+
 func TestFSConcurrentReadersObserveCompleteReplacementRecords(t *testing.T) {
 	fs := newTestFS(t, t.TempDir())
 	old := whiteboardDomain.Whiteboard{
@@ -600,6 +738,53 @@ func TestFSCleanupRemovesUnreferencedGenerationsAndTemps(t *testing.T) {
 	require.Equal(t, unknownContent, readFile(t, filepath.Join(resourceDir, unknownName)))
 }
 
+func TestFSCleanupReclaimsOnlyRecognizedMetadataLessResources(t *testing.T) {
+	tests := []struct {
+		name       string
+		artifacts  map[string][]byte
+		wantExists bool
+	}{
+		{
+			name: "recognized crash artifacts",
+			artifacts: map[string][]byte{
+				"content-11111111111111111111111111111111":        []byte("generation"),
+				".metadata-temp-22222222222222222222222222222222": []byte("metadata temp"),
+			},
+		},
+		{
+			name: "unknown artifact",
+			artifacts: map[string][]byte{
+				"content-11111111111111111111111111111111": []byte("generation"),
+				"operator-notes.txt":                       []byte("preserve exactly"),
+			},
+			wantExists: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			root := t.TempDir()
+			fs := newTestFS(t, root)
+			resourceDir := filepath.Join(root, "images", testID)
+			require.NoError(t, os.Mkdir(resourceDir, directoryPermissions))
+			for name, content := range tt.artifacts {
+				require.NoError(t, os.WriteFile(filepath.Join(resourceDir, name), content, filePermissions))
+			}
+
+			fs.sweep(fs.ctx)
+			_, err := os.Stat(resourceDir)
+			if !tt.wantExists {
+				require.ErrorIs(t, err, os.ErrNotExist)
+				return
+			}
+			require.NoError(t, err)
+			for name, content := range tt.artifacts {
+				require.Equal(t, content, readFile(t, filepath.Join(resourceDir, name)))
+			}
+		})
+	}
+}
+
 func TestFSCloseWaitsForActiveOperationAndRejectsNewOperations(t *testing.T) {
 	root := t.TempDir()
 	fs := newTestFS(t, root)
@@ -865,6 +1050,18 @@ func mustReadRootFile(t *testing.T, root *os.Root, name string) []byte {
 	content, err := root.ReadFile(name)
 	require.NoError(t, err)
 	return content
+}
+
+func readMetadataForTest(root *os.Root) (metadata, error) {
+	encoded, err := root.ReadFile(metadataFilename)
+	if err != nil {
+		return metadata{}, err
+	}
+	var stored metadata
+	if err := json.Unmarshal(encoded, &stored); err != nil {
+		return metadata{}, err
+	}
+	return stored, nil
 }
 
 func assertPermissions(t *testing.T, path string, want os.FileMode) {

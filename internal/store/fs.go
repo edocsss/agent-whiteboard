@@ -43,14 +43,15 @@ type Config struct {
 }
 
 type FS struct {
-	rootPath   string
-	rootHandle *os.Root
-	categories map[string]*os.Root
-	clock      common.Clock
-	ctx        context.Context
-	cancel     context.CancelFunc
-	interval   time.Duration
-	locks      lockSet
+	rootPath      string
+	rootHandle    *os.Root
+	categories    map[string]*os.Root
+	clock         common.Clock
+	ctx           context.Context
+	cancel        context.CancelFunc
+	interval      time.Duration
+	locks         lockSet
+	directorySync func(*os.Root) error
 
 	lifecycleMu sync.Mutex
 	closing     bool
@@ -133,7 +134,7 @@ func NewFS(config Config) (*FS, error) {
 	fs := &FS{
 		rootPath: absoluteRoot, rootHandle: rootHandle, categories: make(map[string]*os.Root, 3),
 		clock: config.Clock, ctx: ctx, cancel: cancel, interval: config.CleanupInterval,
-		locks: lockSet{entries: make(map[string]*lockEntry)}, closeDone: make(chan struct{}),
+		locks: lockSet{entries: make(map[string]*lockEntry)}, directorySync: syncDirectory, closeDone: make(chan struct{}),
 	}
 	for _, name := range []string{"whiteboards", "images", ".readiness"} {
 		if err := ctx.Err(); err != nil {
@@ -293,16 +294,23 @@ func (fs *FS) create(ctx context.Context, namespace, id string, content []byte, 
 		}
 		return storageUnavailable(err)
 	}
+	if err := fs.directorySync(category); err != nil {
+		_ = category.RemoveAll(id)
+		_ = fs.directorySync(category)
+		return storageUnavailable(err)
+	}
 	resource, err := openVerifiedNestedRoot(category, id)
 	if err != nil {
 		_ = category.RemoveAll(id)
+		_ = fs.directorySync(category)
 		return storageUnavailable(err)
 	}
-	committed := false
+	metadataPublished := false
 	defer func() {
 		_ = resource.Close()
-		if !committed {
+		if !metadataPublished {
 			_ = category.RemoveAll(id)
+			_ = fs.directorySync(category)
 		}
 	}()
 	if err := chmodRootDirectory(resource); err != nil {
@@ -311,10 +319,11 @@ func (fs *FS) create(ctx context.Context, namespace, id string, content []byte, 
 	if err := ctxErr(ctx, fs.ctx); err != nil {
 		return err
 	}
-	if err := fs.commit(ctx, resource, content, &stored, ""); err != nil {
+	published, err := fs.commit(ctx, resource, content, &stored, "")
+	metadataPublished = published
+	if err != nil {
 		return err
 	}
-	committed = true
 	return nil
 }
 
@@ -434,7 +443,8 @@ func (fs *FS) replace(ctx context.Context, namespace, id string, content []byte,
 		return storageUnavailable(err)
 	}
 	stored.CreatedAt = old.CreatedAt
-	return fs.commit(ctx, resource, content, &stored, old.ContentFilename)
+	_, err = fs.commit(ctx, resource, content, &stored, old.ContentFilename)
+	return err
 }
 
 func (fs *FS) delete(ctx context.Context, namespace, id, expectedKind string) error {
@@ -536,17 +546,17 @@ func (fs *FS) Close() error {
 	return closeErr
 }
 
-func (fs *FS) commit(ctx context.Context, resource *os.Root, content []byte, stored *metadata, oldGeneration string) error {
+func (fs *FS) commit(ctx context.Context, resource *os.Root, content []byte, stored *metadata, oldGeneration string) (bool, error) {
 	if err := ctxErr(ctx, fs.ctx); err != nil {
-		return err
+		return false, err
 	}
 	contentTempName, contentTemp, err := createExclusiveTemp(resource, ".content-temp-")
 	if err != nil {
-		return storageUnavailable(err)
+		return false, storageUnavailable(err)
 	}
 	publishedGeneration := ""
 	metadataTempName := ""
-	metadataCommitted := false
+	metadataPublished := false
 	defer func() {
 		_ = contentTemp.Close()
 		if contentTempName != "" {
@@ -555,99 +565,107 @@ func (fs *FS) commit(ctx context.Context, resource *os.Root, content []byte, sto
 		if metadataTempName != "" {
 			_ = resource.Remove(metadataTempName)
 		}
-		if publishedGeneration != "" && !metadataCommitted {
+		if publishedGeneration != "" && !metadataPublished {
 			_ = resource.Remove(publishedGeneration)
 		}
 	}()
 	if err := contentTemp.Chmod(filePermissions); err != nil {
-		return storageUnavailable(err)
+		return false, storageUnavailable(err)
 	}
 	if err := ctxErr(ctx, fs.ctx); err != nil {
-		return err
+		return false, err
 	}
 	if err := writeAll(contentTemp, content); err != nil {
-		return storageUnavailable(err)
+		return false, storageUnavailable(err)
 	}
 	if err := ctxErr(ctx, fs.ctx); err != nil {
-		return err
+		return false, err
 	}
 	if err := contentTemp.Sync(); err != nil {
-		return storageUnavailable(err)
+		return false, storageUnavailable(err)
 	}
 	if err := ctxErr(ctx, fs.ctx); err != nil {
-		return err
+		return false, err
 	}
 	if err := contentTemp.Close(); err != nil {
-		return storageUnavailable(err)
+		return false, storageUnavailable(err)
 	}
 	for attempt := 0; attempt < randomNameAttempts; attempt++ {
 		if err := ctxErr(ctx, fs.ctx); err != nil {
-			return err
+			return false, err
 		}
 		generation, err := generationFilename(stored.Kind)
 		if err != nil {
-			return storageUnavailable(err)
+			return false, storageUnavailable(err)
 		}
 		err = publishGeneration(resource, contentTempName, generation)
 		if errors.Is(err, os.ErrExist) {
 			continue
 		}
 		if err != nil {
-			return storageUnavailable(err)
+			return false, storageUnavailable(err)
 		}
 		publishedGeneration = generation
 		contentTempName = ""
 		break
 	}
 	if publishedGeneration == "" {
-		return storageUnavailable(errors.New("generation collision limit exceeded"))
+		return false, storageUnavailable(errors.New("generation collision limit exceeded"))
+	}
+	if err := fs.directorySync(resource); err != nil {
+		return false, storageUnavailable(err)
 	}
 	stored.ContentFilename = publishedGeneration
 	if err := ctxErr(ctx, fs.ctx); err != nil {
-		return err
+		return false, err
 	}
 	encoded, err := json.Marshal(stored)
 	if err != nil {
-		return storageUnavailable(err)
+		return false, storageUnavailable(err)
 	}
 	metadataTempName, metadataTemp, err := createExclusiveTemp(resource, ".metadata-temp-")
 	if err != nil {
-		return storageUnavailable(err)
+		return false, storageUnavailable(err)
 	}
 	defer metadataTemp.Close()
 	if err := metadataTemp.Chmod(filePermissions); err != nil {
-		return storageUnavailable(err)
+		return false, storageUnavailable(err)
 	}
 	if err := ctxErr(ctx, fs.ctx); err != nil {
-		return err
+		return false, err
 	}
 	if err := writeAll(metadataTemp, encoded); err != nil {
-		return storageUnavailable(err)
+		return false, storageUnavailable(err)
 	}
 	if err := ctxErr(ctx, fs.ctx); err != nil {
-		return err
+		return false, err
 	}
 	if err := metadataTemp.Sync(); err != nil {
-		return storageUnavailable(err)
+		return false, storageUnavailable(err)
 	}
 	if err := ctxErr(ctx, fs.ctx); err != nil {
-		return err
+		return false, err
 	}
 	if err := metadataTemp.Close(); err != nil {
-		return storageUnavailable(err)
+		return false, storageUnavailable(err)
 	}
 	if err := ctxErr(ctx, fs.ctx); err != nil {
-		return err
+		return false, err
 	}
 	if err := resource.Rename(metadataTempName, metadataFilename); err != nil {
-		return storageUnavailable(err)
+		return false, storageUnavailable(err)
 	}
 	metadataTempName = ""
-	metadataCommitted = true
-	if oldGeneration != "" && oldGeneration != publishedGeneration {
-		_ = resource.Remove(oldGeneration)
+	metadataPublished = true
+	if err := fs.directorySync(resource); err != nil {
+		return true, storageUnavailable(err)
 	}
-	return nil
+	if oldGeneration != "" && oldGeneration != publishedGeneration {
+		if err := resource.Remove(oldGeneration); err == nil {
+			_ = fs.directorySync(resource)
+		}
+	}
+	return true, nil
 }
 
 func publishGeneration(root *os.Root, temp, final string) error {
@@ -733,7 +751,10 @@ func ensureManagedRoot(parent *os.Root, name string) (*os.Root, error) {
 	if !validInternalFilename(name) {
 		return nil, errors.New("invalid managed directory name")
 	}
-	if err := parent.Mkdir(name, directoryPermissions); err != nil && !errors.Is(err, os.ErrExist) {
+	created := false
+	if err := parent.Mkdir(name, directoryPermissions); err == nil {
+		created = true
+	} else if !errors.Is(err, os.ErrExist) {
 		return nil, err
 	}
 	root, err := openVerifiedNestedRoot(parent, name)
@@ -743,6 +764,12 @@ func ensureManagedRoot(parent *os.Root, name string) (*os.Root, error) {
 	if err := chmodRootDirectory(root); err != nil {
 		_ = root.Close()
 		return nil, err
+	}
+	if created {
+		if err := syncDirectory(parent); err != nil {
+			_ = root.Close()
+			return nil, err
+		}
 	}
 	return root, nil
 }
@@ -856,6 +883,19 @@ func chmodRootDirectory(root *os.Root) error {
 	return directory.Chmod(directoryPermissions)
 }
 
+func syncDirectory(root *os.Root) error {
+	directory, err := root.Open(".")
+	if err != nil {
+		return err
+	}
+	syncErr := directory.Sync()
+	closeErr := directory.Close()
+	if syncErr != nil {
+		return syncErr
+	}
+	return closeErr
+}
+
 func removeResourceContents(root *os.Root) error {
 	directory, err := root.Open(".")
 	if err != nil {
@@ -898,6 +938,10 @@ func (fs *FS) removeOpenedResource(ctx context.Context, namespace, id string, re
 		_ = resource.Close()
 		return storageUnavailable(err)
 	}
+	return fs.removeOpenedResourceDirectory(category, id, resource)
+}
+
+func (fs *FS) removeOpenedResourceDirectory(category *os.Root, id string, resource *os.Root) error {
 	openedInfo, err := resource.Stat(".")
 	if err != nil {
 		_ = resource.Close()
@@ -912,6 +956,9 @@ func (fs *FS) removeOpenedResource(ctx context.Context, namespace, id string, re
 		return storageUnavailable(err)
 	}
 	if err := category.Remove(id); err != nil {
+		return storageUnavailable(err)
+	}
+	if err := fs.directorySync(category); err != nil {
 		return storageUnavailable(err)
 	}
 	return nil
@@ -998,6 +1045,9 @@ func (fs *FS) cleanupResource(ctx context.Context, namespace, id, expectedKind s
 	}
 	stored, err := fs.loadMetadata(ctx, resource, expectedKind)
 	if err != nil {
+		if common.HasCode(err, common.CodeNotFound) {
+			return fs.cleanupIncompleteResource(ctx, namespace, id, resource)
+		}
 		_ = resource.Close()
 		return err
 	}
@@ -1015,22 +1065,59 @@ func (fs *FS) cleanupResource(ctx context.Context, namespace, id, expectedKind s
 	if err := referenced.Close(); err != nil {
 		return storageUnavailable(err)
 	}
-	return removeOrphanArtifacts(resource, namespace, stored.ContentFilename)
+	return fs.removeOrphanArtifacts(resource, namespace, stored.ContentFilename)
 }
 
-func removeOrphanArtifacts(resource *os.Root, namespace, referenced string) error {
-	directory, err := resource.Open(".")
+func (fs *FS) cleanupIncompleteResource(ctx context.Context, namespace, id string, resource *os.Root) error {
+	names, err := rootNames(resource)
+	if err != nil {
+		_ = resource.Close()
+		return storageUnavailable(err)
+	}
+	for _, name := range names {
+		if !cleanupArtifact(namespace, name) {
+			return resource.Close()
+		}
+		file, err := openVerifiedRegular(resource, name)
+		if err != nil {
+			_ = resource.Close()
+			return storageUnavailable(err)
+		}
+		if err := file.Close(); err != nil {
+			_ = resource.Close()
+			return storageUnavailable(err)
+		}
+	}
+	if err := ctxErr(ctx, fs.ctx); err != nil {
+		_ = resource.Close()
+		return err
+	}
+	for _, name := range names {
+		if err := resource.Remove(name); err != nil {
+			_ = resource.Close()
+			return storageUnavailable(err)
+		}
+	}
+	if len(names) > 0 {
+		if err := fs.directorySync(resource); err != nil {
+			_ = resource.Close()
+			return storageUnavailable(err)
+		}
+	}
+	category, err := fs.category(namespace)
+	if err != nil {
+		_ = resource.Close()
+		return err
+	}
+	return fs.removeOpenedResourceDirectory(category, id, resource)
+}
+
+func (fs *FS) removeOrphanArtifacts(resource *os.Root, namespace, referenced string) error {
+	names, err := rootNames(resource)
 	if err != nil {
 		return storageUnavailable(err)
 	}
-	names, readErr := directory.Readdirnames(-1)
-	closeErr := directory.Close()
-	if readErr != nil {
-		return storageUnavailable(readErr)
-	}
-	if closeErr != nil {
-		return storageUnavailable(closeErr)
-	}
+	removed := false
 	for _, name := range names {
 		if name == metadataFilename || name == referenced || !cleanupArtifact(namespace, name) {
 			continue
@@ -1045,8 +1132,30 @@ func removeOrphanArtifacts(resource *os.Root, namespace, referenced string) erro
 		if err := resource.Remove(name); err != nil {
 			return storageUnavailable(err)
 		}
+		removed = true
+	}
+	if removed {
+		if err := fs.directorySync(resource); err != nil {
+			return storageUnavailable(err)
+		}
 	}
 	return nil
+}
+
+func rootNames(root *os.Root) ([]string, error) {
+	directory, err := root.Open(".")
+	if err != nil {
+		return nil, err
+	}
+	names, readErr := directory.Readdirnames(-1)
+	closeErr := directory.Close()
+	if readErr != nil {
+		return nil, readErr
+	}
+	if closeErr != nil {
+		return nil, closeErr
+	}
+	return names, nil
 }
 
 func cleanupArtifact(namespace, name string) bool {
