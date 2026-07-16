@@ -290,6 +290,14 @@ func TestFSConcurrentReadersObserveCompleteReplacementRecords(t *testing.T) {
 		CreatedAt: time.Unix(99, 100).UTC(), UpdatedAt: time.Unix(14, 15).UTC(),
 	}
 	require.NoError(t, fs.Whiteboards().Create(context.Background(), old))
+	key := resourceLockKey("whiteboards", testID)
+	releaseBarrier, err := fs.locks.lock(context.Background(), key)
+	require.NoError(t, err)
+	defer func() {
+		if releaseBarrier != nil {
+			releaseBarrier()
+		}
+	}()
 
 	const readers = 50
 	const writers = 20
@@ -327,6 +335,9 @@ func TestFSConcurrentReadersObserveCompleteReplacementRecords(t *testing.T) {
 		}()
 	}
 	close(start)
+	waitFor(t, 2*time.Second, func() bool { return lockRefs(&fs.locks, key) == readers+writers+1 })
+	releaseBarrier()
+	releaseBarrier = nil
 	workers.Wait()
 	close(errs)
 	for err := range errs {
@@ -443,6 +454,57 @@ func TestFSLazilyDeletesExpiredResourcesAsNotFound(t *testing.T) {
 	}
 }
 
+func TestFSExpiredGetObservesFreshReplacementQueuedDuringLockTransition(t *testing.T) {
+	expires := time.Unix(1_700_000_000, 0).UTC()
+	// Get first observes expiration. A clock correction then lets the already
+	// queued writer replace the old record before Get acquires its write lock.
+	clock := &transitionClock{
+		times:         []time.Time{expires, expires.Add(-time.Second), expires.Add(-time.Second)},
+		firstObserved: make(chan struct{}),
+		resumeFirst:   make(chan struct{}),
+	}
+	fs := newTestFSWithClock(t, t.TempDir(), clock, time.Hour)
+	original := whiteboardDomain.Whiteboard{
+		ID: testID, Kind: whiteboardDomain.KindMarkdown, Source: []byte("expired snapshot"),
+		CreatedAt: expires.Add(-time.Hour), UpdatedAt: expires.Add(-time.Minute), ExpiresAt: &expires,
+	}
+	replacementExpires := expires.Add(time.Hour)
+	replacement := whiteboardDomain.Whiteboard{
+		ID: testID, Kind: whiteboardDomain.KindHTML, Source: []byte("fresh replacement"),
+		CreatedAt: expires.Add(-2 * time.Hour), UpdatedAt: expires, ExpiresAt: &replacementExpires,
+	}
+	require.NoError(t, fs.Whiteboards().Create(context.Background(), original))
+
+	type getResult struct {
+		record whiteboardDomain.Whiteboard
+		err    error
+	}
+	getDone := make(chan getResult, 1)
+	go func() {
+		record, err := fs.Whiteboards().Get(context.Background(), testID)
+		getDone <- getResult{record: record, err: err}
+	}()
+	<-clock.firstObserved
+
+	replaceDone := make(chan error, 1)
+	go func() { replaceDone <- fs.Whiteboards().Replace(context.Background(), replacement) }()
+	key := resourceLockKey("whiteboards", testID)
+	waitFor(t, 2*time.Second, func() bool {
+		return lockRefs(&fs.locks, key) == 2 && writeLockPending(&fs.locks, key)
+	})
+	close(clock.resumeFirst)
+
+	require.NoError(t, <-replaceDone)
+	result := <-getDone
+	require.NoError(t, result.err)
+	require.Equal(t, replacement.Kind, result.record.Kind)
+	require.Equal(t, replacement.Source, result.record.Source)
+	require.True(t, original.CreatedAt.Equal(result.record.CreatedAt))
+	require.True(t, replacement.UpdatedAt.Equal(result.record.UpdatedAt))
+	require.NotNil(t, result.record.ExpiresAt)
+	require.True(t, replacementExpires.Equal(*result.record.ExpiresAt))
+}
+
 func TestFSPeriodicCleanupDeletesExpiredResources(t *testing.T) {
 	start := time.Unix(1_700_000_000, 0).UTC()
 	clock := &testClock{now: start}
@@ -524,6 +586,9 @@ func TestFSCleanupRemovesUnreferencedGenerationsAndTemps(t *testing.T) {
 	for _, name := range orphans {
 		require.NoError(t, os.WriteFile(filepath.Join(resourceDir, name), []byte("orphan"), filePermissions))
 	}
+	unknownName := "operator-notes.txt"
+	unknownContent := []byte("unknown live-resource artifact")
+	require.NoError(t, os.WriteFile(filepath.Join(resourceDir, unknownName), unknownContent, filePermissions))
 
 	fs.sweep(fs.ctx)
 	for _, name := range orphans {
@@ -532,6 +597,7 @@ func TestFSCleanupRemovesUnreferencedGenerationsAndTemps(t *testing.T) {
 	}
 	require.Equal(t, record.Content, readFile(t, filepath.Join(resourceDir, referenced)))
 	require.FileExists(t, filepath.Join(resourceDir, metadataFilename))
+	require.Equal(t, unknownContent, readFile(t, filepath.Join(resourceDir, unknownName)))
 }
 
 func TestFSCloseWaitsForActiveOperationAndRejectsNewOperations(t *testing.T) {
@@ -703,6 +769,32 @@ type testClock struct {
 	now time.Time
 }
 
+type transitionClock struct {
+	mu            sync.Mutex
+	times         []time.Time
+	firstObserved chan struct{}
+	resumeFirst   chan struct{}
+	calls         int
+}
+
+func (clock *transitionClock) Now() time.Time {
+	clock.mu.Lock()
+	if len(clock.times) == 0 {
+		clock.mu.Unlock()
+		panic("transition clock exhausted")
+	}
+	now := clock.times[0]
+	clock.times = clock.times[1:]
+	call := clock.calls
+	clock.calls++
+	clock.mu.Unlock()
+	if call == 0 {
+		close(clock.firstObserved)
+		<-clock.resumeFirst
+	}
+	return now
+}
+
 func (clock *testClock) Now() time.Time {
 	clock.mu.Lock()
 	defer clock.mu.Unlock()
@@ -746,6 +838,20 @@ func lockEntryCount(locks *lockSet) int {
 	locks.mu.Lock()
 	defer locks.mu.Unlock()
 	return len(locks.entries)
+}
+
+func writeLockPending(locks *lockSet, key string) bool {
+	locks.mu.Lock()
+	entry := locks.entries[key]
+	locks.mu.Unlock()
+	if entry == nil {
+		return false
+	}
+	if entry.mu.TryRLock() {
+		entry.mu.RUnlock()
+		return false
+	}
+	return true
 }
 
 func fsClosing(fs *FS) bool {

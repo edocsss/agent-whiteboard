@@ -329,7 +329,7 @@ func TestUpdateReplacesLatestRecordAndPreservesCreationAndExpiration(t *testing.
 			bytes.Equal(got.Source, newSource) &&
 			got.CreatedAt.Equal(createdAt) &&
 			got.UpdatedAt.Equal(now) &&
-			got.ExpiresAt == &currentExpiration
+			got.ExpiresAt != nil && got.ExpiresAt.Equal(currentExpiration)
 	})).Return(nil).Once()
 
 	result, err := service.Update(ctx, whiteboard.UpdateInput{
