@@ -1,0 +1,4 @@
+template: testify
+formatter: goimports
+force-file-write: true
+packages: {}
