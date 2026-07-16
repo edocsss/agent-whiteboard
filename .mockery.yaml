@@ -1,4 +1,17 @@
 template: testify
 formatter: goimports
 force-file-write: true
-packages: {}
+packages:
+  github.com/edocsss/agent-whiteboard/internal/common:
+    config:
+      dir: "{{.InterfaceDir}}/mocks"
+      pkgname: mocks
+    interfaces:
+      Clock:
+        config:
+          filename: mock_clock.go
+          structname: MockClock
+      IDGenerator:
+        config:
+          filename: mock_id_generator.go
+          structname: MockIDGenerator
