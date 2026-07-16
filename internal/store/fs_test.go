@@ -1,4 +1,4 @@
-package store_test
+package store
 
 import (
 	"context"
@@ -11,7 +11,6 @@ import (
 
 	"github.com/edocsss/agent-whiteboard/internal/common"
 	imageDomain "github.com/edocsss/agent-whiteboard/internal/image"
-	"github.com/edocsss/agent-whiteboard/internal/store"
 	whiteboardDomain "github.com/edocsss/agent-whiteboard/internal/whiteboard"
 	"github.com/stretchr/testify/require"
 )
@@ -26,11 +25,53 @@ func TestFSCreateHonorsCanceledLifecycleBeforeInitialization(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	fs, err := store.NewFS(store.Config{Root: root, CleanupInterval: time.Hour, Clock: common.SystemClock{}, Context: ctx})
+	fs, err := NewFS(Config{Root: root, CleanupInterval: time.Hour, Clock: common.SystemClock{}, Context: ctx})
 	require.Nil(t, fs)
 	require.ErrorIs(t, err, context.Canceled)
 	_, statErr := os.Stat(filepath.Join(root, "whiteboards"))
 	require.ErrorIs(t, statErr, os.ErrNotExist)
+}
+
+func TestFSCreateRejectsConfiguredRootSymlink(t *testing.T) {
+	target := t.TempDir()
+	configuredRoot := filepath.Join(t.TempDir(), "storage-link")
+	require.NoError(t, os.Symlink(target, configuredRoot))
+
+	fs, err := NewFS(Config{Root: configuredRoot, CleanupInterval: time.Hour, Clock: common.SystemClock{}, Context: context.Background()})
+	require.Nil(t, fs)
+	assertCodeWithoutRoot(t, err, common.CodeStorageUnavailable, target)
+	_, statErr := os.Stat(filepath.Join(target, "whiteboards"))
+	require.ErrorIs(t, statErr, os.ErrNotExist)
+}
+
+func TestFSCreateRejectsPreexistingCategorySymlink(t *testing.T) {
+	root := t.TempDir()
+	require.NoError(t, os.Mkdir(filepath.Join(root, "real-whiteboards"), 0o700))
+	require.NoError(t, os.Symlink("real-whiteboards", filepath.Join(root, "whiteboards")))
+
+	fs, err := NewFS(Config{Root: root, CleanupInterval: time.Hour, Clock: common.SystemClock{}, Context: context.Background()})
+	require.Nil(t, fs)
+	assertCodeWithoutRoot(t, err, common.CodeStorageUnavailable, root)
+}
+
+func TestPublishGenerationDoesNotClobberAndCanRetry(t *testing.T) {
+	root, err := os.OpenRoot(t.TempDir())
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, root.Close()) })
+	require.NoError(t, root.WriteFile("temp", []byte("new"), 0o600))
+	require.NoError(t, root.WriteFile("content-00000000000000000000000000000000", []byte("committed"), 0o600))
+
+	err = publishGeneration(root, "temp", "content-00000000000000000000000000000000")
+	require.ErrorIs(t, err, os.ErrExist)
+	committed, readErr := root.ReadFile("content-00000000000000000000000000000000")
+	require.NoError(t, readErr)
+	require.Equal(t, []byte("committed"), committed)
+	require.Equal(t, []byte("new"), mustReadRootFile(t, root, "temp"))
+
+	require.NoError(t, publishGeneration(root, "temp", "content-11111111111111111111111111111111"))
+	require.Equal(t, []byte("new"), mustReadRootFile(t, root, "content-11111111111111111111111111111111"))
+	_, err = root.Lstat("temp")
+	require.ErrorIs(t, err, os.ErrNotExist)
 }
 
 func TestFSCreateInitializesLayoutAndRoundTripsWhiteboard(t *testing.T) {
@@ -63,7 +104,7 @@ func TestFSCreateInitializesLayoutAndRoundTripsWhiteboard(t *testing.T) {
 			generation = entry.Name()
 		}
 	}
-	require.Regexp(t, regexp.MustCompile(`^source-[A-Za-z0-9]+\.md$`), generation)
+	require.Regexp(t, regexp.MustCompile(`^source-[a-f0-9]{32}\.md$`), generation)
 	require.Equal(t, record.Source, readFile(t, filepath.Join(resourceDir, generation)))
 
 	var metadata map[string]any
@@ -95,7 +136,7 @@ func TestFSCreateImageUsesExtensionlessInternalGeneration(t *testing.T) {
 	require.Len(t, entries, 2)
 	for _, entry := range entries {
 		if entry.Name() != "metadata.json" {
-			require.Regexp(t, regexp.MustCompile(`^content-[A-Za-z0-9]+$`), entry.Name())
+			require.Regexp(t, regexp.MustCompile(`^content-[a-f0-9]{32}$`), entry.Name())
 			require.NotContains(t, entry.Name(), record.Extension)
 		}
 	}
@@ -169,6 +210,10 @@ func TestFSPathSafetyRejectsManagedSymlinks(t *testing.T) {
 		require.NoError(t, os.Symlink(outside, filepath.Join(dir, generation)))
 		_, err := fs.Whiteboards().Get(context.Background(), testID)
 		assertCodeWithoutRoot(t, err, common.CodeStorageUnavailable, root)
+		linkInfo, statErr := os.Lstat(filepath.Join(dir, generation))
+		require.NoError(t, statErr)
+		require.NotZero(t, linkInfo.Mode()&os.ModeSymlink)
+		require.Equal(t, []byte("escaped"), readFile(t, outside))
 	})
 }
 
@@ -275,12 +320,19 @@ func TestFSReadinessAndSharedIdempotentClose(t *testing.T) {
 	assertCodeWithoutRoot(t, err, common.CodeStorageUnavailable, root)
 }
 
-func newTestFS(t *testing.T, root string) *store.FS {
+func newTestFS(t *testing.T, root string) *FS {
 	t.Helper()
-	fs, err := store.NewFS(store.Config{Root: root, CleanupInterval: time.Hour, Clock: common.SystemClock{}, Context: context.Background()})
+	fs, err := NewFS(Config{Root: root, CleanupInterval: time.Hour, Clock: common.SystemClock{}, Context: context.Background()})
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, fs.Close()) })
 	return fs
+}
+
+func mustReadRootFile(t *testing.T, root *os.Root, name string) []byte {
+	t.Helper()
+	content, err := root.ReadFile(name)
+	require.NoError(t, err)
+	return content
 }
 
 func assertPermissions(t *testing.T, path string, want os.FileMode) {

@@ -26,6 +26,7 @@ const (
 	metadataFilename      = "metadata.json"
 	directoryPermissions  = 0o700
 	filePermissions       = 0o600
+	randomNameAttempts    = 10
 )
 
 var (
@@ -41,10 +42,12 @@ type Config struct {
 }
 
 type FS struct {
-	root   string
-	clock  common.Clock
-	ctx    context.Context
-	cancel context.CancelFunc
+	rootPath   string
+	rootHandle *os.Root
+	categories map[string]*os.Root
+	clock      common.Clock
+	ctx        context.Context
+	cancel     context.CancelFunc
 
 	closeOnce sync.Once
 	mu        sync.RWMutex
@@ -92,37 +95,48 @@ func NewFS(config Config) (*FS, error) {
 	if err != nil {
 		return nil, storageUnavailable(err)
 	}
-	if err := os.MkdirAll(absoluteRoot, directoryPermissions); err != nil {
+	rootInfo, err := os.Lstat(absoluteRoot)
+	if errors.Is(err, os.ErrNotExist) {
+		if err := os.MkdirAll(absoluteRoot, directoryPermissions); err != nil {
+			return nil, storageUnavailable(err)
+		}
+		rootInfo, err = os.Lstat(absoluteRoot)
+	}
+	if err != nil || !realDirectory(rootInfo) {
 		return nil, storageUnavailable(err)
 	}
-	resolvedRoot, err := filepath.EvalSymlinks(absoluteRoot)
+	rootHandle, err := openVerifiedFilesystemRoot(absoluteRoot, rootInfo)
 	if err != nil {
 		return nil, storageUnavailable(err)
 	}
-	resolvedRoot, err = filepath.Abs(resolvedRoot)
-	if err != nil {
-		return nil, storageUnavailable(err)
-	}
-	info, err := os.Lstat(resolvedRoot)
-	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
-		return nil, storageUnavailable(err)
-	}
-	if err := os.Chmod(resolvedRoot, directoryPermissions); err != nil {
+	if err := chmodRootDirectory(rootHandle); err != nil {
+		_ = rootHandle.Close()
 		return nil, storageUnavailable(err)
 	}
 
 	ctx, cancel := context.WithCancel(config.Context)
-	fs := &FS{root: resolvedRoot, clock: config.Clock, ctx: ctx, cancel: cancel}
+	fs := &FS{
+		rootPath: absoluteRoot, rootHandle: rootHandle, categories: make(map[string]*os.Root, 3),
+		clock: config.Clock, ctx: ctx, cancel: cancel,
+	}
 	for _, name := range []string{"whiteboards", "images", ".readiness"} {
-		path, pathErr := fs.containedPath(name)
-		if pathErr != nil {
+		if err := ctx.Err(); err != nil {
+			fs.closeHandles()
 			cancel()
-			return nil, storageUnavailable(pathErr)
+			return nil, err
 		}
-		if err := createManagedDirectory(path); err != nil {
+		if _, err := fs.containedPath(name); err != nil {
+			fs.closeHandles()
 			cancel()
 			return nil, storageUnavailable(err)
 		}
+		category, err := ensureManagedRoot(rootHandle, name)
+		if err != nil {
+			fs.closeHandles()
+			cancel()
+			return nil, storageUnavailable(err)
+		}
+		fs.categories[name] = category
 	}
 	return fs, nil
 }
@@ -210,40 +224,42 @@ func (fs *FS) create(ctx context.Context, namespace, id string, content []byte, 
 	if err := fs.begin(ctx); err != nil {
 		return err
 	}
-	parent, err := fs.namespacePath(namespace)
-	if err != nil {
-		return storageUnavailable(err)
-	}
-	resourceDir, err := fs.resourcePath(namespace, id)
+	category, err := fs.category(namespace)
 	if err != nil {
 		return err
 	}
-	if err := fs.verifyPath(parent, false); err != nil {
-		return storageUnavailable(err)
+	if _, err := fs.resourcePath(namespace, id); err != nil {
+		return err
 	}
 	if err := ctxErr(ctx, fs.ctx); err != nil {
 		return err
 	}
-	if err := os.Mkdir(resourceDir, directoryPermissions); err != nil {
-		info, statErr := os.Lstat(resourceDir)
-		if errors.Is(err, os.ErrExist) && statErr == nil && info.IsDir() && info.Mode()&os.ModeSymlink == 0 {
+	if err := category.Mkdir(id, directoryPermissions); err != nil {
+		info, statErr := category.Lstat(id)
+		if errors.Is(err, os.ErrExist) && statErr == nil && realDirectory(info) {
 			return common.ErrIDCollision
 		}
 		return storageUnavailable(err)
 	}
+	resource, err := openVerifiedNestedRoot(category, id)
+	if err != nil {
+		_ = category.RemoveAll(id)
+		return storageUnavailable(err)
+	}
 	committed := false
 	defer func() {
+		_ = resource.Close()
 		if !committed {
-			_ = os.RemoveAll(resourceDir)
+			_ = category.RemoveAll(id)
 		}
 	}()
-	if err := os.Chmod(resourceDir, directoryPermissions); err != nil {
+	if err := chmodRootDirectory(resource); err != nil {
 		return storageUnavailable(err)
 	}
 	if err := ctxErr(ctx, fs.ctx); err != nil {
 		return err
 	}
-	if err := fs.commit(ctx, resourceDir, content, &stored, ""); err != nil {
+	if err := fs.commit(ctx, resource, content, &stored, ""); err != nil {
 		return err
 	}
 	committed = true
@@ -254,25 +270,19 @@ func (fs *FS) get(ctx context.Context, namespace, id, expectedKind string) ([]by
 	if err := fs.begin(ctx); err != nil {
 		return nil, metadata{}, err
 	}
-	resourceDir, err := fs.resourcePath(namespace, id)
+	resource, err := fs.openResource(namespace, id)
 	if err != nil {
 		return nil, metadata{}, err
 	}
-	stored, err := fs.loadMetadata(ctx, resourceDir, expectedKind)
+	defer resource.Close()
+	stored, err := fs.loadMetadata(ctx, resource, expectedKind)
 	if err != nil {
 		return nil, metadata{}, err
 	}
-	contentPath, err := fs.containedPath(namespace, id, stored.ContentFilename)
-	if err != nil {
+	if err := fs.validateResourceFilename(namespace, id, stored.ContentFilename); err != nil {
 		return nil, metadata{}, storageUnavailable(err)
 	}
-	if err := fs.verifyRegularFile(contentPath); err != nil {
-		return nil, metadata{}, storageUnavailable(err)
-	}
-	if err := ctxErr(ctx, fs.ctx); err != nil {
-		return nil, metadata{}, err
-	}
-	content, err := os.ReadFile(contentPath)
+	content, err := readVerifiedFile(resource, stored.ContentFilename)
 	if err != nil {
 		return nil, metadata{}, storageUnavailable(err)
 	}
@@ -286,42 +296,66 @@ func (fs *FS) replace(ctx context.Context, namespace, id string, content []byte,
 	if err := fs.begin(ctx); err != nil {
 		return err
 	}
-	resourceDir, err := fs.resourcePath(namespace, id)
+	resource, err := fs.openResource(namespace, id)
 	if err != nil {
 		return err
 	}
-	old, err := fs.loadMetadata(ctx, resourceDir, expectedKind)
+	defer resource.Close()
+	old, err := fs.loadMetadata(ctx, resource, expectedKind)
 	if err != nil {
 		return err
 	}
-	oldContent, err := fs.containedPath(namespace, id, old.ContentFilename)
+	if err := fs.validateResourceFilename(namespace, id, old.ContentFilename); err != nil {
+		return storageUnavailable(err)
+	}
+	oldFile, err := openVerifiedRegular(resource, old.ContentFilename)
 	if err != nil {
 		return storageUnavailable(err)
 	}
-	if err := fs.verifyRegularFile(oldContent); err != nil {
+	if err := oldFile.Close(); err != nil {
 		return storageUnavailable(err)
 	}
-	return fs.commit(ctx, resourceDir, content, &stored, old.ContentFilename)
+	return fs.commit(ctx, resource, content, &stored, old.ContentFilename)
 }
 
 func (fs *FS) delete(ctx context.Context, namespace, id, expectedKind string) error {
 	if err := fs.begin(ctx); err != nil {
 		return err
 	}
-	resourceDir, err := fs.resourcePath(namespace, id)
+	category, err := fs.category(namespace)
 	if err != nil {
 		return err
 	}
-	if _, err := fs.loadMetadata(ctx, resourceDir, expectedKind); err != nil {
+	resource, err := fs.openResource(namespace, id)
+	if err != nil {
 		return err
 	}
-	if err := fs.verifyTree(resourceDir); err != nil {
+	if _, err := fs.loadMetadata(ctx, resource, expectedKind); err != nil {
+		_ = resource.Close()
+		return err
+	}
+	if err := removeResourceContents(resource); err != nil {
+		_ = resource.Close()
+		return storageUnavailable(err)
+	}
+	openedInfo, err := resource.Stat(".")
+	if err != nil {
+		_ = resource.Close()
+		return storageUnavailable(err)
+	}
+	currentInfo, err := category.Lstat(id)
+	if err != nil || !realDirectory(currentInfo) || !os.SameFile(openedInfo, currentInfo) {
+		_ = resource.Close()
 		return storageUnavailable(err)
 	}
 	if err := ctxErr(ctx, fs.ctx); err != nil {
+		_ = resource.Close()
 		return err
 	}
-	if err := os.RemoveAll(resourceDir); err != nil {
+	if err := resource.Close(); err != nil {
+		return storageUnavailable(err)
+	}
+	if err := category.Remove(id); err != nil {
 		return storageUnavailable(err)
 	}
 	return nil
@@ -331,44 +365,34 @@ func (fs *FS) Ready(ctx context.Context) error {
 	if err := fs.begin(ctx); err != nil {
 		return err
 	}
-	dir, err := fs.containedPath(".readiness")
+	readiness, err := fs.category(".readiness")
 	if err != nil {
-		return storageUnavailable(err)
-	}
-	if err := fs.verifyPath(dir, false); err != nil {
-		return storageUnavailable(err)
-	}
-	if err := ctxErr(ctx, fs.ctx); err != nil {
 		return err
 	}
-	probe, err := os.CreateTemp(dir, ".probe-*")
+	probeName, probe, err := createExclusiveTemp(readiness, ".probe-")
 	if err != nil {
 		return storageUnavailable(err)
 	}
-	probePath := probe.Name()
-	defer os.Remove(probePath)
+	defer func() {
+		_ = probe.Close()
+		_ = readiness.Remove(probeName)
+	}()
 	if err := probe.Chmod(filePermissions); err != nil {
-		_ = probe.Close()
 		return storageUnavailable(err)
 	}
 	if err := ctxErr(ctx, fs.ctx); err != nil {
-		_ = probe.Close()
 		return err
 	}
-	if _, err := probe.Write([]byte("ready")); err != nil {
-		_ = probe.Close()
+	if err := writeAll(probe, []byte("ready")); err != nil {
 		return storageUnavailable(err)
 	}
 	if err := ctxErr(ctx, fs.ctx); err != nil {
-		_ = probe.Close()
 		return err
 	}
 	if err := probe.Sync(); err != nil {
-		_ = probe.Close()
 		return storageUnavailable(err)
 	}
 	if err := ctxErr(ctx, fs.ctx); err != nil {
-		_ = probe.Close()
 		return err
 	}
 	if err := probe.Close(); err != nil {
@@ -377,7 +401,7 @@ func (fs *FS) Ready(ctx context.Context) error {
 	if err := ctxErr(ctx, fs.ctx); err != nil {
 		return err
 	}
-	if err := os.Remove(probePath); err != nil {
+	if err := readiness.Remove(probeName); err != nil {
 		return storageUnavailable(err)
 	}
 	return nil
@@ -389,34 +413,34 @@ func (fs *FS) Close() error {
 		fs.closed = true
 		fs.mu.Unlock()
 		fs.cancel()
+		if err := fs.closeHandles(); err != nil {
+			fs.closeErr = storageUnavailable(err)
+		}
 	})
 	return fs.closeErr
 }
 
-func (fs *FS) commit(ctx context.Context, resourceDir string, content []byte, stored *metadata, oldGeneration string) (returnErr error) {
+func (fs *FS) commit(ctx context.Context, resource *os.Root, content []byte, stored *metadata, oldGeneration string) error {
 	if err := ctxErr(ctx, fs.ctx); err != nil {
 		return err
 	}
-	generation, err := generationFilename(stored.Kind)
+	contentTempName, contentTemp, err := createExclusiveTemp(resource, ".content-temp-")
 	if err != nil {
 		return storageUnavailable(err)
 	}
-	generationPath, err := fs.containedResourceFile(resourceDir, generation)
-	if err != nil {
-		return storageUnavailable(err)
-	}
-	contentTemp, err := os.CreateTemp(resourceDir, ".content-temp-*")
-	if err != nil {
-		return storageUnavailable(err)
-	}
-	contentTempPath := contentTemp.Name()
-	generationCommitted := false
+	publishedGeneration := ""
+	metadataTempName := ""
 	metadataCommitted := false
 	defer func() {
 		_ = contentTemp.Close()
-		_ = os.Remove(contentTempPath)
-		if generationCommitted && !metadataCommitted {
-			_ = os.Remove(generationPath)
+		if contentTempName != "" {
+			_ = resource.Remove(contentTempName)
+		}
+		if metadataTempName != "" {
+			_ = resource.Remove(metadataTempName)
+		}
+		if publishedGeneration != "" && !metadataCommitted {
+			_ = resource.Remove(publishedGeneration)
 		}
 	}()
 	if err := contentTemp.Chmod(filePermissions); err != nil {
@@ -440,14 +464,29 @@ func (fs *FS) commit(ctx context.Context, resourceDir string, content []byte, st
 	if err := contentTemp.Close(); err != nil {
 		return storageUnavailable(err)
 	}
-	if err := ctxErr(ctx, fs.ctx); err != nil {
-		return err
+	for attempt := 0; attempt < randomNameAttempts; attempt++ {
+		if err := ctxErr(ctx, fs.ctx); err != nil {
+			return err
+		}
+		generation, err := generationFilename(stored.Kind)
+		if err != nil {
+			return storageUnavailable(err)
+		}
+		err = publishGeneration(resource, contentTempName, generation)
+		if errors.Is(err, os.ErrExist) {
+			continue
+		}
+		if err != nil {
+			return storageUnavailable(err)
+		}
+		publishedGeneration = generation
+		contentTempName = ""
+		break
 	}
-	if err := os.Rename(contentTempPath, generationPath); err != nil {
-		return storageUnavailable(err)
+	if publishedGeneration == "" {
+		return storageUnavailable(errors.New("generation collision limit exceeded"))
 	}
-	generationCommitted = true
-	stored.ContentFilename = generation
+	stored.ContentFilename = publishedGeneration
 	if err := ctxErr(ctx, fs.ctx); err != nil {
 		return err
 	}
@@ -455,15 +494,11 @@ func (fs *FS) commit(ctx context.Context, resourceDir string, content []byte, st
 	if err != nil {
 		return storageUnavailable(err)
 	}
-	metadataTemp, err := os.CreateTemp(resourceDir, ".metadata-temp-*")
+	metadataTempName, metadataTemp, err := createExclusiveTemp(resource, ".metadata-temp-")
 	if err != nil {
 		return storageUnavailable(err)
 	}
-	metadataTempPath := metadataTemp.Name()
-	defer func() {
-		_ = metadataTemp.Close()
-		_ = os.Remove(metadataTempPath)
-	}()
+	defer metadataTemp.Close()
 	if err := metadataTemp.Chmod(filePermissions); err != nil {
 		return storageUnavailable(err)
 	}
@@ -488,45 +523,40 @@ func (fs *FS) commit(ctx context.Context, resourceDir string, content []byte, st
 	if err := ctxErr(ctx, fs.ctx); err != nil {
 		return err
 	}
-	metadataPath, err := fs.containedResourceFile(resourceDir, metadataFilename)
-	if err != nil {
+	if err := resource.Rename(metadataTempName, metadataFilename); err != nil {
 		return storageUnavailable(err)
 	}
-	if err := os.Rename(metadataTempPath, metadataPath); err != nil {
-		return storageUnavailable(err)
-	}
+	metadataTempName = ""
 	metadataCommitted = true
-	if oldGeneration != "" && oldGeneration != generation {
-		oldPath, pathErr := fs.containedResourceFile(resourceDir, oldGeneration)
-		if pathErr == nil {
-			_ = os.Remove(oldPath)
-		}
+	if oldGeneration != "" && oldGeneration != publishedGeneration {
+		_ = resource.Remove(oldGeneration)
 	}
 	return nil
 }
 
-func (fs *FS) loadMetadata(ctx context.Context, resourceDir, expectedKind string) (metadata, error) {
-	if err := fs.verifyDirectory(resourceDir); err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return metadata{}, notFound()
-		}
-		return metadata{}, storageUnavailable(err)
+func publishGeneration(root *os.Root, temp, final string) error {
+	if !validInternalFilename(temp) || !validInternalFilename(final) {
+		return errors.New("invalid generation filename")
 	}
-	metadataPath, err := fs.containedResourceFile(resourceDir, metadataFilename)
-	if err != nil {
-		return metadata{}, storageUnavailable(err)
+	if err := root.Link(temp, final); err != nil {
+		return err
 	}
-	if err := fs.verifyRegularFile(metadataPath); err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return metadata{}, notFound()
-		}
-		return metadata{}, storageUnavailable(err)
+	if err := root.Remove(temp); err != nil {
+		_ = root.Remove(final)
+		return err
 	}
+	return nil
+}
+
+func (fs *FS) loadMetadata(ctx context.Context, resource *os.Root, expectedKind string) (metadata, error) {
 	if err := ctxErr(ctx, fs.ctx); err != nil {
 		return metadata{}, err
 	}
-	encoded, err := os.ReadFile(metadataPath)
+	encoded, err := readVerifiedFile(resource, metadataFilename)
 	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return metadata{}, notFound()
+		}
 		return metadata{}, storageUnavailable(err)
 	}
 	decoder := json.NewDecoder(bytes.NewReader(encoded))
@@ -544,6 +574,217 @@ func (fs *FS) loadMetadata(ctx context.Context, resourceDir, expectedKind string
 	return stored, nil
 }
 
+func (fs *FS) openResource(namespace, id string) (*os.Root, error) {
+	if _, err := fs.resourcePath(namespace, id); err != nil {
+		return nil, err
+	}
+	category, err := fs.category(namespace)
+	if err != nil {
+		return nil, err
+	}
+	resource, err := openVerifiedNestedRoot(category, id)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, notFound()
+		}
+		return nil, storageUnavailable(err)
+	}
+	return resource, nil
+}
+
+func openVerifiedFilesystemRoot(path string, before os.FileInfo) (*os.Root, error) {
+	if !realDirectory(before) {
+		return nil, errors.New("configured root is not a real directory")
+	}
+	root, err := os.OpenRoot(path)
+	if err != nil {
+		return nil, err
+	}
+	opened, err := root.Stat(".")
+	if err != nil || !opened.IsDir() || !os.SameFile(before, opened) {
+		_ = root.Close()
+		return nil, errors.New("configured root identity changed while opening")
+	}
+	after, err := os.Lstat(path)
+	if err != nil || !realDirectory(after) || !os.SameFile(opened, after) {
+		_ = root.Close()
+		return nil, errors.New("configured root identity changed after opening")
+	}
+	return root, nil
+}
+
+func ensureManagedRoot(parent *os.Root, name string) (*os.Root, error) {
+	if !validInternalFilename(name) {
+		return nil, errors.New("invalid managed directory name")
+	}
+	if err := parent.Mkdir(name, directoryPermissions); err != nil && !errors.Is(err, os.ErrExist) {
+		return nil, err
+	}
+	root, err := openVerifiedNestedRoot(parent, name)
+	if err != nil {
+		return nil, err
+	}
+	if err := chmodRootDirectory(root); err != nil {
+		_ = root.Close()
+		return nil, err
+	}
+	return root, nil
+}
+
+func openVerifiedNestedRoot(parent *os.Root, name string) (*os.Root, error) {
+	if !validInternalFilename(name) {
+		return nil, errors.New("invalid managed directory name")
+	}
+	before, err := parent.Lstat(name)
+	if err != nil {
+		return nil, err
+	}
+	if !realDirectory(before) {
+		return nil, errors.New("managed path is not a real directory")
+	}
+	root, err := parent.OpenRoot(name)
+	if err != nil {
+		return nil, err
+	}
+	opened, err := root.Stat(".")
+	if err != nil || !opened.IsDir() || !os.SameFile(before, opened) {
+		_ = root.Close()
+		return nil, errors.New("managed directory identity changed while opening")
+	}
+	after, err := parent.Lstat(name)
+	if err != nil || !realDirectory(after) || !os.SameFile(opened, after) {
+		_ = root.Close()
+		return nil, errors.New("managed directory identity changed after opening")
+	}
+	return root, nil
+}
+
+func openVerifiedRegular(root *os.Root, name string) (*os.File, error) {
+	if !validInternalFilename(name) {
+		return nil, errors.New("invalid internal filename")
+	}
+	file, err := root.Open(name)
+	if err != nil {
+		return nil, err
+	}
+	pathInfo, err := root.Lstat(name)
+	if err != nil || pathInfo.Mode()&os.ModeSymlink != 0 || !pathInfo.Mode().IsRegular() {
+		_ = file.Close()
+		return nil, errors.New("managed file is not a real regular file")
+	}
+	openedInfo, err := file.Stat()
+	if err != nil || !openedInfo.Mode().IsRegular() || !os.SameFile(pathInfo, openedInfo) {
+		_ = file.Close()
+		return nil, errors.New("managed file identity changed while opening")
+	}
+	pathInfo, err = root.Lstat(name)
+	if err != nil || pathInfo.Mode()&os.ModeSymlink != 0 || !pathInfo.Mode().IsRegular() || !os.SameFile(pathInfo, openedInfo) {
+		_ = file.Close()
+		return nil, errors.New("managed file identity changed after opening")
+	}
+	return file, nil
+}
+
+func readVerifiedFile(root *os.Root, name string) ([]byte, error) {
+	file, err := openVerifiedRegular(root, name)
+	if err != nil {
+		return nil, err
+	}
+	content, readErr := io.ReadAll(file)
+	closeErr := file.Close()
+	if readErr != nil {
+		return nil, readErr
+	}
+	if closeErr != nil {
+		return nil, closeErr
+	}
+	return content, nil
+}
+
+func createExclusiveTemp(root *os.Root, prefix string) (string, *os.File, error) {
+	if !validInternalFilename(prefix + "placeholder") {
+		return "", nil, errors.New("invalid temporary filename prefix")
+	}
+	for attempt := 0; attempt < randomNameAttempts; attempt++ {
+		random, err := randomHex(16)
+		if err != nil {
+			return "", nil, err
+		}
+		name := prefix + random
+		file, err := root.OpenFile(name, os.O_RDWR|os.O_CREATE|os.O_EXCL, filePermissions)
+		if errors.Is(err, os.ErrExist) {
+			continue
+		}
+		if err != nil {
+			return "", nil, err
+		}
+		return name, file, nil
+	}
+	return "", nil, errors.New("temporary filename collision limit exceeded")
+}
+
+func chmodRootDirectory(root *os.Root) error {
+	directory, err := root.Open(".")
+	if err != nil {
+		return err
+	}
+	defer directory.Close()
+	opened, err := directory.Stat()
+	if err != nil || !opened.IsDir() {
+		return errors.New("opened root is not a directory")
+	}
+	rootInfo, err := root.Stat(".")
+	if err != nil || !os.SameFile(opened, rootInfo) {
+		return errors.New("opened root identity mismatch")
+	}
+	return directory.Chmod(directoryPermissions)
+}
+
+func removeResourceContents(root *os.Root) error {
+	directory, err := root.Open(".")
+	if err != nil {
+		return err
+	}
+	names, readErr := directory.Readdirnames(-1)
+	closeErr := directory.Close()
+	if readErr != nil {
+		return readErr
+	}
+	if closeErr != nil {
+		return closeErr
+	}
+	for _, name := range names {
+		file, err := openVerifiedRegular(root, name)
+		if err != nil {
+			return err
+		}
+		if err := file.Close(); err != nil {
+			return err
+		}
+		if err := root.Remove(name); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (fs *FS) closeHandles() error {
+	var result error
+	for _, name := range []string{".readiness", "images", "whiteboards"} {
+		if root := fs.categories[name]; root != nil {
+			if err := root.Close(); err != nil && result == nil {
+				result = err
+			}
+		}
+	}
+	if fs.rootHandle != nil {
+		if err := fs.rootHandle.Close(); err != nil && result == nil {
+			result = err
+		}
+	}
+	return result
+}
+
 func (fs *FS) begin(ctx context.Context) error {
 	if ctx == nil {
 		return invalidRequest("context is required")
@@ -557,25 +798,26 @@ func (fs *FS) begin(ctx context.Context) error {
 	if closed {
 		return storageUnavailable(nil)
 	}
-	if err := fs.ctx.Err(); err != nil {
-		return err
-	}
-	return nil
+	return fs.ctx.Err()
 }
 
-func (fs *FS) namespacePath(namespace string) (string, error) {
-	if namespace != "whiteboards" && namespace != "images" {
-		return "", errors.New("invalid namespace")
+func (fs *FS) category(namespace string) (*os.Root, error) {
+	if namespace != "whiteboards" && namespace != "images" && namespace != ".readiness" {
+		return nil, storageUnavailable(errors.New("invalid namespace"))
 	}
-	return fs.containedPath(namespace)
+	root := fs.categories[namespace]
+	if root == nil {
+		return nil, storageUnavailable(errors.New("managed category unavailable"))
+	}
+	return root, nil
 }
 
 func (fs *FS) resourcePath(namespace, id string) (string, error) {
 	if err := common.ValidateID(id); err != nil {
 		return "", err
 	}
-	if _, err := fs.namespacePath(namespace); err != nil {
-		return "", storageUnavailable(err)
+	if namespace != "whiteboards" && namespace != "images" {
+		return "", storageUnavailable(errors.New("invalid namespace"))
 	}
 	path, err := fs.containedPath(namespace, id)
 	if err != nil {
@@ -584,114 +826,29 @@ func (fs *FS) resourcePath(namespace, id string) (string, error) {
 	return path, nil
 }
 
-func (fs *FS) containedResourceFile(resourceDir, filename string) (string, error) {
-	if filename == "" || filepath.Base(filename) != filename || filename == "." || filename == ".." {
-		return "", errors.New("invalid internal filename")
+func (fs *FS) validateResourceFilename(namespace, id, filename string) error {
+	if !validInternalFilename(filename) {
+		return errors.New("invalid internal filename")
 	}
-	relative, err := filepath.Rel(fs.root, resourceDir)
-	if err != nil || escapesRoot(relative) {
-		return "", errors.New("resource directory escapes root")
-	}
-	return fs.containedPath(relative, filename)
+	_, err := fs.containedPath(namespace, id, filename)
+	return err
 }
 
 func (fs *FS) containedPath(elements ...string) (string, error) {
-	target := filepath.Join(append([]string{fs.root}, elements...)...)
-	relative, err := filepath.Rel(fs.root, target)
+	target := filepath.Join(append([]string{fs.rootPath}, elements...)...)
+	relative, err := filepath.Rel(fs.rootPath, target)
 	if err != nil || escapesRoot(relative) {
 		return "", errors.New("path escapes storage root")
 	}
 	return target, nil
 }
 
-func (fs *FS) verifyPath(path string, allowMissing bool) error {
-	relative, err := filepath.Rel(fs.root, path)
-	if err != nil || escapesRoot(relative) {
-		return errors.New("path escapes storage root")
-	}
-	current := fs.root
-	for _, component := range splitPath(relative) {
-		current = filepath.Join(current, component)
-		info, statErr := os.Lstat(current)
-		if statErr != nil {
-			if allowMissing && errors.Is(statErr, os.ErrNotExist) {
-				return nil
-			}
-			return statErr
-		}
-		if info.Mode()&os.ModeSymlink != 0 {
-			return errors.New("symlink in managed path")
-		}
-	}
-	resolved, err := filepath.EvalSymlinks(path)
-	if err != nil {
-		return err
-	}
-	resolvedRelative, err := filepath.Rel(fs.root, resolved)
-	if err != nil || escapesRoot(resolvedRelative) {
-		return errors.New("resolved path escapes storage root")
-	}
-	return nil
+func realDirectory(info os.FileInfo) bool {
+	return info != nil && info.IsDir() && info.Mode()&os.ModeSymlink == 0
 }
 
-func (fs *FS) verifyDirectory(path string) error {
-	if err := fs.verifyPath(path, false); err != nil {
-		return err
-	}
-	info, err := os.Lstat(path)
-	if err != nil {
-		return err
-	}
-	if !info.IsDir() {
-		return errors.New("managed directory is not a directory")
-	}
-	return nil
-}
-
-func (fs *FS) verifyRegularFile(path string) error {
-	if err := fs.verifyPath(path, false); err != nil {
-		return err
-	}
-	info, err := os.Lstat(path)
-	if err != nil {
-		return err
-	}
-	if !info.Mode().IsRegular() {
-		return errors.New("managed file is not regular")
-	}
-	return nil
-}
-
-func (fs *FS) verifyTree(root string) error {
-	return filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
-		}
-		if entry.Type()&os.ModeSymlink != 0 {
-			return errors.New("symlink in managed tree")
-		}
-		contained, err := filepath.Rel(fs.root, path)
-		if err != nil || escapesRoot(contained) {
-			return errors.New("managed tree escapes storage root")
-		}
-		return nil
-	})
-}
-
-func createManagedDirectory(path string) error {
-	if err := os.Mkdir(path, directoryPermissions); err != nil {
-		if !errors.Is(err, os.ErrExist) {
-			return err
-		}
-		info, statErr := os.Lstat(path)
-		if statErr != nil {
-			return statErr
-		}
-		if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
-			return errors.New("managed path is not a real directory")
-		}
-	}
-	return os.Chmod(path, directoryPermissions)
+func validInternalFilename(name string) bool {
+	return name != "" && name != "." && name != ".." && filepath.Base(name) == name
 }
 
 func validateWhiteboardRecord(record whiteboardDomain.Whiteboard) error {
@@ -758,11 +915,10 @@ func imageMetadata(record imageDomain.Image) metadata {
 }
 
 func generationFilename(kind string) (string, error) {
-	random := make([]byte, 16)
-	if _, err := io.ReadFull(rand.Reader, random); err != nil {
+	generation, err := randomHex(16)
+	if err != nil {
 		return "", err
 	}
-	generation := hex.EncodeToString(random)
 	switch kind {
 	case string(whiteboardDomain.KindMarkdown):
 		return "source-" + generation + ".md", nil
@@ -773,6 +929,14 @@ func generationFilename(kind string) (string, error) {
 	default:
 		return "", errors.New("invalid resource kind")
 	}
+}
+
+func randomHex(bytesCount int) (string, error) {
+	random := make([]byte, bytesCount)
+	if _, err := io.ReadFull(rand.Reader, random); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(random), nil
 }
 
 func validImageFormat(extension, mediaType string) bool {
@@ -838,13 +1002,6 @@ func writeAll(file *os.File, content []byte) error {
 		content = content[written:]
 	}
 	return nil
-}
-
-func splitPath(path string) []string {
-	if path == "." || path == "" {
-		return nil
-	}
-	return strings.Split(filepath.Clean(path), string(filepath.Separator))
 }
 
 func escapesRoot(relative string) bool {
