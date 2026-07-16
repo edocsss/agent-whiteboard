@@ -1,6 +1,6 @@
 # agent-whiteboard Master Technical Design
 
-**Status:** Approved design, ready for implementation planning
+**Status:** Approved design, implementation plans complete
 
 **Source:** `Product Requirements Document: agent-whiteboard` (21 pages)
 
@@ -50,6 +50,7 @@ These refinements take precedence over conflicting wording in the source PRD.
 - Logging: standard-library `log/slog`
 - Mock generation: Mockery v3.7.1
 - Mock runtime and assertions: Testify v1.11.1
+- Browser-tooling runtime: Node.js 24.x
 - JavaScript package manager: pnpm 11.4 with a committed lockfile
 - Markdown renderer: markdown-it 14.2.0
 - Sanitizer: DOMPurify 3.4.12
@@ -143,7 +144,7 @@ skills/agent-whiteboard/
 
 `internal/image` owns image models, service operations, its required storage interface, signature detection, allowlisting, and image HTTP handlers.
 
-`internal/store/fs.go` contains the complete filesystem implementation: directory layout, metadata encoding, safe replacement, per-resource locks, expiration enforcement, cleanup, readiness, and closure. It implements both domain-owned store interfaces.
+`internal/store/fs.go` contains the complete filesystem implementation: directory layout, metadata encoding, safe replacement, per-resource locks, expiration enforcement, cleanup, readiness, and closure. Because Go cannot overload the same method names for different domain record types, one `FS` exposes thin `Whiteboards()` and `Images()` views that implement the two domain-owned store interfaces while sharing the same filesystem state and lifecycle. The views and all implementation logic remain in `fs.go`.
 
 `internal/assets` owns browser source, compiled assets, embedding, and third-party license notices. Assets are not nested under the whiteboard domain.
 
@@ -159,7 +160,7 @@ skills/agent-whiteboard/
 CLI -> private HTTP client -> domain HTTP handlers -> domain services
                                                     -> domain store interfaces
 
-filesystem store -----------------------implements--> domain store interfaces
+filesystem store -> domain-specific views --implements--> domain store interfaces
 
 public facade -> app -> whiteboard service
                      -> image service
@@ -172,15 +173,22 @@ Business domains do not reach into another domain's storage. If a future whitebo
 
 All non-value dependencies use constructor injection. There are no package-global services, mutable singletons, reflection-based containers, or service locators.
 
-Production composition is equivalent to:
+Production composition is equivalent to the following (error handling omitted for brevity):
 
 ```go
-whiteboards := whiteboard.NewService(whiteboardStore, clock, idGenerator)
-images := image.NewService(imageStore, clock, idGenerator)
-application := app.New(whiteboards, images, logger)
+whiteboards, _ := whiteboard.NewService(whiteboardStore, clock, idGenerator, defaultExpiration)
+images, _ := image.NewService(imageStore, clock, idGenerator, defaultExpiration, logger)
+viewer, _ := whiteboard.NewViewer(whiteboard.ViewerConfig{CSS: viewerCSS, JS: viewerJS})
+whiteboardHTTP, _ := whiteboard.NewHandler(whiteboards, viewer, whiteboardHandlerConfig)
+imageHTTP, _ := image.NewHandler(images, imageHandlerConfig)
+application, _ := app.New(app.Config{
+    Whiteboards: whiteboardHTTP,
+    Images: imageHTTP,
+    Readiness: []app.Readiness{whiteboardStore, imageStore},
+})
 ```
 
-The public `agentwb.New(Config)` constructor chooses production defaults only when the caller omits optional overrides. Internal constructors require their dependencies explicitly and reject nil required dependencies.
+The public `agentwb.New(Config, ...Option)` constructor chooses production defaults only when the caller omits optional overrides. Internal constructors require their dependencies explicitly and reject nil required dependencies.
 
 Mock boundaries are deliberately narrow:
 
@@ -237,7 +245,9 @@ Default values:
 | Multi-image request limit | 100 MiB |
 | Log mode | `console` |
 
-Advanced functional options may inject an already-open `net.Listener`, asset filesystem, clock, or ID generator. These options exist for embedding and hermetic tests, not routine configuration.
+Advanced functional options may inject an already-open `net.Listener`, viewer asset bytes, clock, or ID generator. These options exist for embedding and hermetic tests, not routine configuration.
+
+Two explicit-zero options resolve otherwise ambiguous Go zero values: `WithPort(0)` requests an OS-assigned port, and `WithDefaultExpiration(0)` makes new resources permanent by default. Without those options, zero-valued `Config.Port` and `Config.DefaultExpirationSeconds` select their documented defaults.
 
 ### 6.2 Service operations
 
@@ -292,7 +302,7 @@ type ImageStore interface {
 }
 ```
 
-Store methods receive public record types and `context.Context`. `Close` must be idempotent because one custom struct may implement both store interfaces.
+Store methods receive public record types and `context.Context`. `Close` must be idempotent because two custom domain views may delegate to the same backend lifecycle owner and therefore close that owner twice.
 
 Stores must:
 
@@ -331,6 +341,8 @@ type Image struct {
 ### 7.1 Identity
 
 IDs contain 192 bits from `crypto/rand` and use unpadded URL-safe Base64, producing exactly 32 characters. Validation accepts only that encoding and length. Client filenames never become IDs or filesystem paths.
+
+Storage reports an internal ID-collision sentinel when a generated resource directory already exists. Domain services retry a collision up to three times; the sentinel is never exposed as an HTTP or public error code.
 
 The ID is the capability for viewing, updating, and deleting a resource. There is no separate edit token. Documentation treats IDs as sensitive capability values even though server logs do not treat the resource contents as secret storage.
 
@@ -401,6 +413,8 @@ One process owns one filesystem root. The store uses standard-library synchroniz
 Context is checked before lock acquisition and immediately after acquisition. Standard mutex waits are not cancelable; bounded file sizes and local-disk operations keep critical sections short.
 
 ### 8.5 Cleanup
+
+`store.NewFS` returns one lifecycle owner. `FS.Whiteboards()` and `FS.Images()` return thin domain views with `Create`, `Get`, `Replace`, `Delete`, `Ready`, and `Close`; both delegate to that owner. This avoids impossible overloaded Go methods without splitting filesystem behavior across files or duplicating locks and cleanup.
 
 The filesystem store enforces expiration in two ways:
 
@@ -615,7 +629,7 @@ agent-whiteboard image delete <id>
 
 Client flags include `--server`, `--json`, `--expires-in`, and `--timeout`. The default server is `http://127.0.0.1:8567`; the default client timeout is 30 seconds.
 
-Server flags include `--host`, `--port`, `--storage`, `--cleanup-interval`, `--default-expires-in`, `--shutdown-timeout`, `--log-mode`, and all upload-limit settings.
+Server flags are `--host`, `--port`, `--storage`, `--cleanup-interval`, `--default-expires-in`, `--shutdown-timeout`, `--log-mode`, `--max-whiteboard-bytes`, `--max-image-bytes`, and `--max-image-request-bytes`.
 
 Configuration precedence is:
 
@@ -645,11 +659,14 @@ Machine output is a documented contract:
 
 Multi-image output contains an ordered `resources` array. Machine errors use the same schema version plus stable code and message. JSON mode emits only contract JSON on stdout; diagnostics go to stderr.
 
+Process exit codes are 0 for success, 1 for an unexpected internal failure, 2 for CLI usage/configuration, 3 for a stable remote API/domain error, and 4 for deadline/cancellation. A signal-triggered server shutdown that completes its lifecycle successfully exits 0.
+
 ## 13. Context Rules
 
 - Every public service and store method accepts `context.Context` first.
 - HTTP handlers pass `request.Context()` unchanged.
-- Domain services pass that context unchanged to stores.
+- Domain services pass that context unchanged to all primary store operations.
+- Image compensating deletion is the sole domain exception: it uses a five-second context derived with `context.WithoutCancel` and `context.WithTimeout` so cancellation does not strand already-created images while request values remain available.
 - Cobra executes with `ExecuteContext`.
 - HTTP clients use `http.NewRequestWithContext`.
 - Request paths never use `context.Background()` or `context.TODO()`.
