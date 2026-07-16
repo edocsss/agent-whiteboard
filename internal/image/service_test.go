@@ -172,6 +172,23 @@ func TestServiceCreateRetriesOnlyCollisionsPerResource(t *testing.T) {
 	require.Equal(t, []string{testID, testID3}, []string{result[0].ID, result[1].ID})
 }
 
+func TestServiceCreateRollsBackAttemptedIDOnNonCollisionError(t *testing.T) {
+	service, store, clock, ids := newTestService(t, 0, discardLogger())
+	ctx := context.Background()
+	persistenceErr := errors.New("uncertain create")
+
+	clock.EXPECT().Now().Return(time.Unix(1_700_000_000, 0).UTC()).Once()
+	ids.EXPECT().NewID().Return(testID, nil).Once()
+	store.EXPECT().Create(sameContext(ctx), mock.MatchedBy(func(record imageDomain.Image) bool {
+		return record.ID == testID
+	})).Return(persistenceErr).Once()
+	store.EXPECT().Delete(mock.Anything, testID).Return(nil).Once()
+
+	result, err := service.CreateImages(ctx, imageDomain.CreateInput{Images: []imageDomain.Upload{{Content: encodedPNG(t)}}})
+	require.Nil(t, result)
+	require.Same(t, persistenceErr, err)
+}
+
 func TestServiceCreateRollsBackPriorImagesInReverseOrderAndReturnsPersistenceError(t *testing.T) {
 	service, store, clock, ids := newTestService(t, 0, discardLogger())
 	ctx := context.WithValue(context.Background(), contextKey{}, "rollback")
@@ -189,7 +206,7 @@ func TestServiceCreateRollsBackPriorImagesInReverseOrderAndReturnsPersistenceErr
 	store.EXPECT().Delete(mock.Anything, mock.Anything).RunAndReturn(func(_ context.Context, id string) error {
 		deleted = append(deleted, id)
 		return nil
-	}).Twice()
+	}).Times(3)
 
 	result, err := service.CreateImages(ctx, imageDomain.CreateInput{Images: []imageDomain.Upload{
 		{Content: encodedPNG(t)},
@@ -198,7 +215,7 @@ func TestServiceCreateRollsBackPriorImagesInReverseOrderAndReturnsPersistenceErr
 	}})
 	require.Nil(t, result)
 	require.ErrorIs(t, err, persistenceErr)
-	require.Equal(t, []string{testID2, testID}, deleted)
+	require.Equal(t, []string{testID3, testID2, testID}, deleted)
 }
 
 func TestServiceCreateRollsBackAfterCollisionExhaustion(t *testing.T) {
@@ -233,6 +250,7 @@ func TestServiceCreateRollbackRetainsValuesAndSurvivesParentCancellation(t *test
 	ctx, cancel := context.WithCancel(parent)
 	now := time.Unix(1_700_000_000, 0).UTC()
 	persistenceErr := errors.New("write failed after cancel")
+	var deleted []string
 
 	clock.EXPECT().Now().Return(now).Once()
 	ids.EXPECT().NewID().Return(testID, nil).Once()
@@ -249,7 +267,10 @@ func TestServiceCreateRollbackRetainsValuesAndSurvivesParentCancellation(t *test
 			ok &&
 			time.Until(deadline) > 4*time.Second &&
 			time.Until(deadline) <= 5*time.Second
-	}), testID).Return(nil).Once()
+	}), mock.Anything).RunAndReturn(func(_ context.Context, id string) error {
+		deleted = append(deleted, id)
+		return nil
+	}).Twice()
 
 	result, err := service.CreateImages(ctx, imageDomain.CreateInput{Images: []imageDomain.Upload{
 		{Content: encodedPNG(t)},
@@ -258,6 +279,7 @@ func TestServiceCreateRollbackRetainsValuesAndSurvivesParentCancellation(t *test
 	require.Nil(t, result)
 	require.ErrorIs(t, err, persistenceErr)
 	require.ErrorIs(t, ctx.Err(), context.Canceled)
+	require.Equal(t, []string{testID2, testID}, deleted)
 }
 
 func TestServiceCreateLogsRollbackFailureWithoutCapabilityIDs(t *testing.T) {
@@ -273,6 +295,7 @@ func TestServiceCreateLogsRollbackFailureWithoutCapabilityIDs(t *testing.T) {
 	ids.EXPECT().NewID().Return(testID2, nil).Once()
 	store.EXPECT().Create(mock.Anything, mock.MatchedBy(func(record imageDomain.Image) bool { return record.ID == testID })).Return(nil).Once()
 	store.EXPECT().Create(mock.Anything, mock.MatchedBy(func(record imageDomain.Image) bool { return record.ID == testID2 })).Return(persistenceErr).Once()
+	store.EXPECT().Delete(mock.Anything, testID2).Return(nil).Once()
 	store.EXPECT().Delete(mock.Anything, testID).Return(rollbackErr).Once()
 
 	_, err := service.CreateImages(context.Background(), imageDomain.CreateInput{Images: []imageDomain.Upload{

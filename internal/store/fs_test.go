@@ -1,10 +1,15 @@
 package store
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"image"
+	"image/png"
+	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -414,6 +419,48 @@ func TestFSMetadataDirectorySyncFailurePreservesPublishedRecord(t *testing.T) {
 			stored := decodeMetadata(t, filepath.Join(root, "whiteboards", testID, metadataFilename))
 			require.FileExists(t, filepath.Join(root, "whiteboards", testID, stored["content_filename"].(string)))
 		})
+	}
+}
+
+func TestImageServiceRollsBackUncertainFSCreate(t *testing.T) {
+	root := t.TempDir()
+	fs := newTestFS(t, root)
+	ids := &sequenceIDGenerator{ids: []string{testID, testID2}}
+	service, err := imageDomain.NewService(
+		fs.Images(),
+		common.SystemClock{},
+		ids,
+		0,
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+	)
+	require.NoError(t, err)
+
+	syncFailure := errors.New("injected uncertain image commit")
+	resourceSyncs := 0
+	failed := false
+	fs.directorySync = func(directory *os.Root) error {
+		if directory != fs.categories["images"] {
+			resourceSyncs++
+			if !failed && resourceSyncs == 4 {
+				failed = true
+				return syncFailure
+			}
+		}
+		return syncDirectory(directory)
+	}
+
+	content := encodedStoreTestPNG(t)
+	result, err := service.CreateImages(context.Background(), imageDomain.CreateInput{Images: []imageDomain.Upload{
+		{Content: content},
+		{Content: content},
+	}})
+	require.Nil(t, result)
+	require.ErrorIs(t, err, syncFailure)
+	require.True(t, common.HasCode(err, common.CodeStorageUnavailable))
+	require.True(t, failed)
+	for _, id := range []string{testID, testID2} {
+		_, statErr := os.Stat(filepath.Join(root, "images", id))
+		require.ErrorIs(t, statErr, os.ErrNotExist, id)
 	}
 }
 
@@ -962,6 +1009,20 @@ type transitionClock struct {
 	calls         int
 }
 
+type sequenceIDGenerator struct {
+	ids   []string
+	index int
+}
+
+func (generator *sequenceIDGenerator) NewID() (string, error) {
+	if generator.index >= len(generator.ids) {
+		return "", errors.New("test ID sequence exhausted")
+	}
+	id := generator.ids[generator.index]
+	generator.index++
+	return id, nil
+}
+
 func (clock *transitionClock) Now() time.Time {
 	clock.mu.Lock()
 	if len(clock.times) == 0 {
@@ -1076,6 +1137,13 @@ func readFile(t *testing.T, path string) []byte {
 	content, err := os.ReadFile(path)
 	require.NoError(t, err)
 	return content
+}
+
+func encodedStoreTestPNG(t *testing.T) []byte {
+	t.Helper()
+	var encoded bytes.Buffer
+	require.NoError(t, png.Encode(&encoded, image.NewRGBA(image.Rect(0, 0, 1, 1))))
+	return encoded.Bytes()
 }
 
 func decodeMetadata(t *testing.T, path string) map[string]any {

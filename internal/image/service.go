@@ -80,6 +80,9 @@ func (s *Service) CreateImages(ctx context.Context, input CreateInput) ([]Result
 	for _, record := range prepared {
 		created, err := s.createOne(ctx, record)
 		if err != nil {
+			if created.ID != "" {
+				createdIDs = append(createdIDs, created.ID)
+			}
 			s.rollback(ctx, createdIDs)
 			return nil, err
 		}
@@ -101,7 +104,7 @@ func (s *Service) createOne(ctx context.Context, record Image) (Image, error) {
 			if errors.Is(err, common.ErrIDCollision) {
 				continue
 			}
-			return Image{}, err
+			return record, err
 		}
 		return record, nil
 	}
