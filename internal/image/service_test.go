@@ -223,7 +223,8 @@ func TestServiceCreateRollsBackAfterCollisionExhaustion(t *testing.T) {
 		{Content: encodedGIF(t)},
 	}})
 	require.Nil(t, result)
-	require.Same(t, terminalCollision, err)
+	assertDomainError(t, err, common.CodeInternal, "internal error")
+	require.NotErrorIs(t, err, common.ErrIDCollision)
 }
 
 func TestServiceCreateRollbackRetainsValuesAndSurvivesParentCancellation(t *testing.T) {

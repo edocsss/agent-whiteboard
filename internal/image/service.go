@@ -91,7 +91,6 @@ func (s *Service) CreateImages(ctx context.Context, input CreateInput) ([]Result
 }
 
 func (s *Service) createOne(ctx context.Context, record Image) (Image, error) {
-	var collisionErr error
 	for attempt := 0; attempt < createAttempts; attempt++ {
 		id, err := s.ids.NewID()
 		if err != nil {
@@ -100,7 +99,6 @@ func (s *Service) createOne(ctx context.Context, record Image) (Image, error) {
 		record.ID = id
 		if err := s.store.Create(ctx, record); err != nil {
 			if errors.Is(err, common.ErrIDCollision) {
-				collisionErr = err
 				continue
 			}
 			return Image{}, err
@@ -108,7 +106,7 @@ func (s *Service) createOne(ctx context.Context, record Image) (Image, error) {
 		return record, nil
 	}
 
-	return Image{}, collisionErr
+	return Image{}, common.NewError(common.CodeInternal, "internal error", nil)
 }
 
 func (s *Service) rollback(parent context.Context, createdIDs []string) {
