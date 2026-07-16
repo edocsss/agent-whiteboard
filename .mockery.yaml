@@ -24,3 +24,12 @@ packages:
         config:
           filename: mock_store.go
           structname: MockStore
+  github.com/edocsss/agent-whiteboard/internal/image:
+    config:
+      dir: "{{.InterfaceDir}}/mocks"
+      pkgname: mocks
+    interfaces:
+      Store:
+        config:
+          filename: mock_store.go
+          structname: MockStore
