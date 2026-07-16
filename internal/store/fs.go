@@ -32,6 +32,7 @@ const (
 var (
 	whiteboardGenerationPattern = regexp.MustCompile(`^source-[a-f0-9]{32}\.(md|html)$`)
 	imageGenerationPattern      = regexp.MustCompile(`^content-[a-f0-9]{32}$`)
+	temporaryArtifactPattern    = regexp.MustCompile(`^\.(content|metadata)-temp-[a-f0-9]{32}$`)
 )
 
 type Config struct {
@@ -48,11 +49,25 @@ type FS struct {
 	clock      common.Clock
 	ctx        context.Context
 	cancel     context.CancelFunc
+	interval   time.Duration
+	locks      lockSet
 
-	closeOnce sync.Once
-	mu        sync.RWMutex
-	closed    bool
-	closeErr  error
+	lifecycleMu sync.Mutex
+	closing     bool
+	active      sync.WaitGroup
+	cleanup     sync.WaitGroup
+	closeDone   chan struct{}
+	closeErr    error
+}
+
+type lockEntry struct {
+	mu   sync.RWMutex
+	refs int
+}
+
+type lockSet struct {
+	mu      sync.Mutex
+	entries map[string]*lockEntry
 }
 
 type whiteboardView struct{ fs *FS }
@@ -117,7 +132,8 @@ func NewFS(config Config) (*FS, error) {
 	ctx, cancel := context.WithCancel(config.Context)
 	fs := &FS{
 		rootPath: absoluteRoot, rootHandle: rootHandle, categories: make(map[string]*os.Root, 3),
-		clock: config.Clock, ctx: ctx, cancel: cancel,
+		clock: config.Clock, ctx: ctx, cancel: cancel, interval: config.CleanupInterval,
+		locks: lockSet{entries: make(map[string]*lockEntry)}, closeDone: make(chan struct{}),
 	}
 	for _, name := range []string{"whiteboards", "images", ".readiness"} {
 		if err := ctx.Err(); err != nil {
@@ -138,6 +154,8 @@ func NewFS(config Config) (*FS, error) {
 		}
 		fs.categories[name] = category
 	}
+	fs.cleanup.Add(1)
+	go fs.cleanupLoop()
 	return fs, nil
 }
 
@@ -145,6 +163,10 @@ func (fs *FS) Whiteboards() whiteboardDomain.Store { return &whiteboardView{fs: 
 func (fs *FS) Images() imageDomain.Store           { return &imageView{fs: fs} }
 
 func (view *whiteboardView) Create(ctx context.Context, record whiteboardDomain.Whiteboard) error {
+	if err := view.fs.beginOperation(ctx); err != nil {
+		return err
+	}
+	defer view.fs.active.Done()
 	if err := validateWhiteboardRecord(record); err != nil {
 		return err
 	}
@@ -152,6 +174,10 @@ func (view *whiteboardView) Create(ctx context.Context, record whiteboardDomain.
 }
 
 func (view *whiteboardView) Get(ctx context.Context, id string) (whiteboardDomain.Whiteboard, error) {
+	if err := view.fs.beginOperation(ctx); err != nil {
+		return whiteboardDomain.Whiteboard{}, err
+	}
+	defer view.fs.active.Done()
 	if err := common.ValidateID(id); err != nil {
 		return whiteboardDomain.Whiteboard{}, err
 	}
@@ -166,6 +192,10 @@ func (view *whiteboardView) Get(ctx context.Context, id string) (whiteboardDomai
 }
 
 func (view *whiteboardView) Replace(ctx context.Context, record whiteboardDomain.Whiteboard) error {
+	if err := view.fs.beginOperation(ctx); err != nil {
+		return err
+	}
+	defer view.fs.active.Done()
 	if err := validateWhiteboardRecord(record); err != nil {
 		return err
 	}
@@ -173,6 +203,10 @@ func (view *whiteboardView) Replace(ctx context.Context, record whiteboardDomain
 }
 
 func (view *whiteboardView) Delete(ctx context.Context, id string) error {
+	if err := view.fs.beginOperation(ctx); err != nil {
+		return err
+	}
+	defer view.fs.active.Done()
 	if err := common.ValidateID(id); err != nil {
 		return err
 	}
@@ -183,6 +217,10 @@ func (view *whiteboardView) Ready(ctx context.Context) error { return view.fs.Re
 func (view *whiteboardView) Close() error                    { return view.fs.Close() }
 
 func (view *imageView) Create(ctx context.Context, record imageDomain.Image) error {
+	if err := view.fs.beginOperation(ctx); err != nil {
+		return err
+	}
+	defer view.fs.active.Done()
 	if err := validateImageRecord(record); err != nil {
 		return err
 	}
@@ -190,6 +228,10 @@ func (view *imageView) Create(ctx context.Context, record imageDomain.Image) err
 }
 
 func (view *imageView) Get(ctx context.Context, id string) (imageDomain.Image, error) {
+	if err := view.fs.beginOperation(ctx); err != nil {
+		return imageDomain.Image{}, err
+	}
+	defer view.fs.active.Done()
 	if err := common.ValidateID(id); err != nil {
 		return imageDomain.Image{}, err
 	}
@@ -204,6 +246,10 @@ func (view *imageView) Get(ctx context.Context, id string) (imageDomain.Image, e
 }
 
 func (view *imageView) Replace(ctx context.Context, record imageDomain.Image) error {
+	if err := view.fs.beginOperation(ctx); err != nil {
+		return err
+	}
+	defer view.fs.active.Done()
 	if err := validateImageRecord(record); err != nil {
 		return err
 	}
@@ -211,6 +257,10 @@ func (view *imageView) Replace(ctx context.Context, record imageDomain.Image) er
 }
 
 func (view *imageView) Delete(ctx context.Context, id string) error {
+	if err := view.fs.beginOperation(ctx); err != nil {
+		return err
+	}
+	defer view.fs.active.Done()
 	if err := common.ValidateID(id); err != nil {
 		return err
 	}
@@ -221,9 +271,11 @@ func (view *imageView) Ready(ctx context.Context) error { return view.fs.Ready(c
 func (view *imageView) Close() error                    { return view.fs.Close() }
 
 func (fs *FS) create(ctx context.Context, namespace, id string, content []byte, stored metadata) error {
-	if err := fs.begin(ctx); err != nil {
+	release, err := fs.locks.lock(ctx, resourceLockKey(namespace, id))
+	if err != nil {
 		return err
 	}
+	defer release()
 	category, err := fs.category(namespace)
 	if err != nil {
 		return err
@@ -267,24 +319,35 @@ func (fs *FS) create(ctx context.Context, namespace, id string, content []byte, 
 }
 
 func (fs *FS) get(ctx context.Context, namespace, id, expectedKind string) ([]byte, metadata, error) {
-	if err := fs.begin(ctx); err != nil {
+	key := resourceLockKey(namespace, id)
+	release, err := fs.locks.rlock(ctx, key)
+	if err != nil {
 		return nil, metadata{}, err
 	}
 	resource, err := fs.openResource(namespace, id)
 	if err != nil {
+		release()
 		return nil, metadata{}, err
 	}
-	defer resource.Close()
 	stored, err := fs.loadMetadata(ctx, resource, expectedKind)
 	if err != nil {
+		_ = resource.Close()
+		release()
 		return nil, metadata{}, err
 	}
-	if err := fs.validateResourceFilename(namespace, id, stored.ContentFilename); err != nil {
-		return nil, metadata{}, storageUnavailable(err)
+	if fs.isExpired(stored) {
+		_ = resource.Close()
+		release()
+		return fs.getAfterExpiration(ctx, namespace, id, expectedKind, key)
 	}
-	content, err := readVerifiedFile(resource, stored.ContentFilename)
+	content, err := fs.readStoredContent(namespace, id, resource, stored)
+	closeErr := resource.Close()
+	release()
 	if err != nil {
-		return nil, metadata{}, storageUnavailable(err)
+		return nil, metadata{}, err
+	}
+	if closeErr != nil {
+		return nil, metadata{}, storageUnavailable(closeErr)
 	}
 	if err := ctxErr(ctx, fs.ctx); err != nil {
 		return nil, metadata{}, err
@@ -292,19 +355,74 @@ func (fs *FS) get(ctx context.Context, namespace, id, expectedKind string) ([]by
 	return content, stored, nil
 }
 
+func (fs *FS) getAfterExpiration(ctx context.Context, namespace, id, expectedKind, key string) ([]byte, metadata, error) {
+	release, err := fs.locks.lock(ctx, key)
+	if err != nil {
+		return nil, metadata{}, err
+	}
+	defer release()
+	resource, err := fs.openResource(namespace, id)
+	if err != nil {
+		return nil, metadata{}, err
+	}
+	stored, err := fs.loadMetadata(ctx, resource, expectedKind)
+	if err != nil {
+		_ = resource.Close()
+		return nil, metadata{}, err
+	}
+	if fs.isExpired(stored) {
+		if err := fs.removeOpenedResource(ctx, namespace, id, resource); err != nil {
+			return nil, metadata{}, err
+		}
+		return nil, metadata{}, notFound()
+	}
+	content, err := fs.readStoredContent(namespace, id, resource, stored)
+	closeErr := resource.Close()
+	if err != nil {
+		return nil, metadata{}, err
+	}
+	if closeErr != nil {
+		return nil, metadata{}, storageUnavailable(closeErr)
+	}
+	if err := ctxErr(ctx, fs.ctx); err != nil {
+		return nil, metadata{}, err
+	}
+	return content, stored, nil
+}
+
+func (fs *FS) readStoredContent(namespace, id string, resource *os.Root, stored metadata) ([]byte, error) {
+	if err := fs.validateResourceFilename(namespace, id, stored.ContentFilename); err != nil {
+		return nil, storageUnavailable(err)
+	}
+	content, err := readVerifiedFile(resource, stored.ContentFilename)
+	if err != nil {
+		return nil, storageUnavailable(err)
+	}
+	return content, nil
+}
+
 func (fs *FS) replace(ctx context.Context, namespace, id string, content []byte, stored metadata, expectedKind string) error {
-	if err := fs.begin(ctx); err != nil {
+	release, err := fs.locks.lock(ctx, resourceLockKey(namespace, id))
+	if err != nil {
 		return err
 	}
+	defer release()
 	resource, err := fs.openResource(namespace, id)
 	if err != nil {
 		return err
 	}
-	defer resource.Close()
 	old, err := fs.loadMetadata(ctx, resource, expectedKind)
 	if err != nil {
+		_ = resource.Close()
 		return err
 	}
+	if fs.isExpired(old) {
+		if err := fs.removeOpenedResource(ctx, namespace, id, resource); err != nil {
+			return err
+		}
+		return notFound()
+	}
+	defer resource.Close()
 	if err := fs.validateResourceFilename(namespace, id, old.ContentFilename); err != nil {
 		return storageUnavailable(err)
 	}
@@ -315,56 +433,40 @@ func (fs *FS) replace(ctx context.Context, namespace, id string, content []byte,
 	if err := oldFile.Close(); err != nil {
 		return storageUnavailable(err)
 	}
+	stored.CreatedAt = old.CreatedAt
 	return fs.commit(ctx, resource, content, &stored, old.ContentFilename)
 }
 
 func (fs *FS) delete(ctx context.Context, namespace, id, expectedKind string) error {
-	if err := fs.begin(ctx); err != nil {
-		return err
-	}
-	category, err := fs.category(namespace)
+	release, err := fs.locks.lock(ctx, resourceLockKey(namespace, id))
 	if err != nil {
 		return err
 	}
+	defer release()
 	resource, err := fs.openResource(namespace, id)
 	if err != nil {
 		return err
 	}
-	if _, err := fs.loadMetadata(ctx, resource, expectedKind); err != nil {
-		_ = resource.Close()
-		return err
-	}
-	if err := removeResourceContents(resource); err != nil {
-		_ = resource.Close()
-		return storageUnavailable(err)
-	}
-	openedInfo, err := resource.Stat(".")
+	stored, err := fs.loadMetadata(ctx, resource, expectedKind)
 	if err != nil {
 		_ = resource.Close()
-		return storageUnavailable(err)
-	}
-	currentInfo, err := category.Lstat(id)
-	if err != nil || !realDirectory(currentInfo) || !os.SameFile(openedInfo, currentInfo) {
-		_ = resource.Close()
-		return storageUnavailable(err)
-	}
-	if err := ctxErr(ctx, fs.ctx); err != nil {
-		_ = resource.Close()
 		return err
 	}
-	if err := resource.Close(); err != nil {
-		return storageUnavailable(err)
+	expired := fs.isExpired(stored)
+	if err := fs.removeOpenedResource(ctx, namespace, id, resource); err != nil {
+		return err
 	}
-	if err := category.Remove(id); err != nil {
-		return storageUnavailable(err)
+	if expired {
+		return notFound()
 	}
 	return nil
 }
 
 func (fs *FS) Ready(ctx context.Context) error {
-	if err := fs.begin(ctx); err != nil {
+	if err := fs.beginOperation(ctx); err != nil {
 		return err
 	}
+	defer fs.active.Done()
 	readiness, err := fs.category(".readiness")
 	if err != nil {
 		return err
@@ -408,16 +510,30 @@ func (fs *FS) Ready(ctx context.Context) error {
 }
 
 func (fs *FS) Close() error {
-	fs.closeOnce.Do(func() {
-		fs.mu.Lock()
-		fs.closed = true
-		fs.mu.Unlock()
-		fs.cancel()
-		if err := fs.closeHandles(); err != nil {
-			fs.closeErr = storageUnavailable(err)
-		}
-	})
-	return fs.closeErr
+	fs.lifecycleMu.Lock()
+	if fs.closing {
+		done := fs.closeDone
+		fs.lifecycleMu.Unlock()
+		<-done
+		return fs.closeErr
+	}
+	fs.closing = true
+	done := fs.closeDone
+	fs.lifecycleMu.Unlock()
+
+	fs.cancel()
+	fs.cleanup.Wait()
+	fs.active.Wait()
+	closeErr := fs.closeHandles()
+	if closeErr != nil {
+		closeErr = storageUnavailable(closeErr)
+	}
+
+	fs.lifecycleMu.Lock()
+	fs.closeErr = closeErr
+	close(done)
+	fs.lifecycleMu.Unlock()
+	return closeErr
 }
 
 func (fs *FS) commit(ctx context.Context, resource *os.Root, content []byte, stored *metadata, oldGeneration string) error {
@@ -768,37 +884,270 @@ func removeResourceContents(root *os.Root) error {
 	return nil
 }
 
+func (fs *FS) removeOpenedResource(ctx context.Context, namespace, id string, resource *os.Root) error {
+	category, err := fs.category(namespace)
+	if err != nil {
+		_ = resource.Close()
+		return err
+	}
+	if err := ctxErr(ctx, fs.ctx); err != nil {
+		_ = resource.Close()
+		return err
+	}
+	if err := removeResourceContents(resource); err != nil {
+		_ = resource.Close()
+		return storageUnavailable(err)
+	}
+	openedInfo, err := resource.Stat(".")
+	if err != nil {
+		_ = resource.Close()
+		return storageUnavailable(err)
+	}
+	currentInfo, err := category.Lstat(id)
+	if err != nil || !realDirectory(currentInfo) || !os.SameFile(openedInfo, currentInfo) {
+		_ = resource.Close()
+		return storageUnavailable(err)
+	}
+	if err := resource.Close(); err != nil {
+		return storageUnavailable(err)
+	}
+	if err := category.Remove(id); err != nil {
+		return storageUnavailable(err)
+	}
+	return nil
+}
+
+func (fs *FS) isExpired(stored metadata) bool {
+	return common.IsExpired(fs.clock.Now(), stored.ExpiresAt.timePtr())
+}
+
+func (fs *FS) cleanupLoop() {
+	defer fs.cleanup.Done()
+	if fs.interval <= 0 {
+		<-fs.ctx.Done()
+		return
+	}
+	ticker := time.NewTicker(fs.interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-fs.ctx.Done():
+			return
+		case <-ticker.C:
+			fs.sweep(fs.ctx)
+		}
+	}
+}
+
+func (fs *FS) sweep(ctx context.Context) {
+	for _, candidate := range []struct {
+		namespace    string
+		expectedKind string
+	}{
+		{namespace: "whiteboards", expectedKind: "whiteboard"},
+		{namespace: "images", expectedKind: "image"},
+	} {
+		if ctx.Err() != nil {
+			return
+		}
+		ids, err := fs.categoryIDs(candidate.namespace)
+		if err != nil {
+			continue
+		}
+		for _, id := range ids {
+			if ctx.Err() != nil {
+				return
+			}
+			if err := common.ValidateID(id); err != nil {
+				continue
+			}
+			release, err := fs.locks.lock(ctx, resourceLockKey(candidate.namespace, id))
+			if err != nil {
+				return
+			}
+			_ = fs.cleanupResource(ctx, candidate.namespace, id, candidate.expectedKind)
+			release()
+		}
+	}
+}
+
+func (fs *FS) categoryIDs(namespace string) ([]string, error) {
+	category, err := fs.category(namespace)
+	if err != nil {
+		return nil, err
+	}
+	directory, err := category.Open(".")
+	if err != nil {
+		return nil, storageUnavailable(err)
+	}
+	ids, readErr := directory.Readdirnames(-1)
+	closeErr := directory.Close()
+	if readErr != nil {
+		return nil, storageUnavailable(readErr)
+	}
+	if closeErr != nil {
+		return nil, storageUnavailable(closeErr)
+	}
+	return ids, nil
+}
+
+func (fs *FS) cleanupResource(ctx context.Context, namespace, id, expectedKind string) error {
+	resource, err := fs.openResource(namespace, id)
+	if err != nil {
+		return err
+	}
+	stored, err := fs.loadMetadata(ctx, resource, expectedKind)
+	if err != nil {
+		_ = resource.Close()
+		return err
+	}
+	if fs.isExpired(stored) {
+		return fs.removeOpenedResource(ctx, namespace, id, resource)
+	}
+	defer resource.Close()
+	if err := fs.validateResourceFilename(namespace, id, stored.ContentFilename); err != nil {
+		return storageUnavailable(err)
+	}
+	referenced, err := openVerifiedRegular(resource, stored.ContentFilename)
+	if err != nil {
+		return storageUnavailable(err)
+	}
+	if err := referenced.Close(); err != nil {
+		return storageUnavailable(err)
+	}
+	return removeOrphanArtifacts(resource, namespace, stored.ContentFilename)
+}
+
+func removeOrphanArtifacts(resource *os.Root, namespace, referenced string) error {
+	directory, err := resource.Open(".")
+	if err != nil {
+		return storageUnavailable(err)
+	}
+	names, readErr := directory.Readdirnames(-1)
+	closeErr := directory.Close()
+	if readErr != nil {
+		return storageUnavailable(readErr)
+	}
+	if closeErr != nil {
+		return storageUnavailable(closeErr)
+	}
+	for _, name := range names {
+		if name == metadataFilename || name == referenced || !cleanupArtifact(namespace, name) {
+			continue
+		}
+		file, err := openVerifiedRegular(resource, name)
+		if err != nil {
+			return storageUnavailable(err)
+		}
+		if err := file.Close(); err != nil {
+			return storageUnavailable(err)
+		}
+		if err := resource.Remove(name); err != nil {
+			return storageUnavailable(err)
+		}
+	}
+	return nil
+}
+
+func cleanupArtifact(namespace, name string) bool {
+	if temporaryArtifactPattern.MatchString(name) {
+		return true
+	}
+	if namespace == "whiteboards" {
+		return whiteboardGenerationPattern.MatchString(name)
+	}
+	if namespace == "images" {
+		return imageGenerationPattern.MatchString(name)
+	}
+	return false
+}
+
 func (fs *FS) closeHandles() error {
-	var result error
+	var closeErrors []error
 	for _, name := range []string{".readiness", "images", "whiteboards"} {
 		if root := fs.categories[name]; root != nil {
-			if err := root.Close(); err != nil && result == nil {
-				result = err
+			if err := root.Close(); err != nil {
+				closeErrors = append(closeErrors, err)
 			}
 		}
 	}
 	if fs.rootHandle != nil {
-		if err := fs.rootHandle.Close(); err != nil && result == nil {
-			result = err
+		if err := fs.rootHandle.Close(); err != nil {
+			closeErrors = append(closeErrors, err)
 		}
 	}
-	return result
+	return errors.Join(closeErrors...)
 }
 
-func (fs *FS) begin(ctx context.Context) error {
+func (fs *FS) beginOperation(ctx context.Context) error {
 	if ctx == nil {
 		return invalidRequest("context is required")
 	}
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	fs.mu.RLock()
-	closed := fs.closed
-	fs.mu.RUnlock()
-	if closed {
+	fs.lifecycleMu.Lock()
+	defer fs.lifecycleMu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if fs.closing {
 		return storageUnavailable(nil)
 	}
-	return fs.ctx.Err()
+	if err := fs.ctx.Err(); err != nil {
+		return err
+	}
+	fs.active.Add(1)
+	return nil
+}
+
+func resourceLockKey(namespace, id string) string {
+	return namespace + "/" + id
+}
+
+func (locks *lockSet) lock(ctx context.Context, key string) (func(), error) {
+	return locks.acquire(ctx, key, false)
+}
+
+func (locks *lockSet) rlock(ctx context.Context, key string) (func(), error) {
+	return locks.acquire(ctx, key, true)
+}
+
+func (locks *lockSet) acquire(ctx context.Context, key string, read bool) (func(), error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	locks.mu.Lock()
+	entry := locks.entries[key]
+	if entry == nil {
+		entry = &lockEntry{}
+		locks.entries[key] = entry
+	}
+	entry.refs++
+	locks.mu.Unlock()
+	if read {
+		entry.mu.RLock()
+	} else {
+		entry.mu.Lock()
+	}
+	release := func() {
+		if read {
+			entry.mu.RUnlock()
+		} else {
+			entry.mu.Unlock()
+		}
+		locks.mu.Lock()
+		entry.refs--
+		if entry.refs == 0 {
+			delete(locks.entries, key)
+		}
+		locks.mu.Unlock()
+	}
+	if err := ctx.Err(); err != nil {
+		release()
+		return nil, err
+	}
+	return release, nil
 }
 
 func (fs *FS) category(namespace string) (*os.Root, error) {

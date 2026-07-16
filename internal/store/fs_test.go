@@ -3,9 +3,12 @@ package store
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
+	"sync"
 	"testing"
 	"time"
 
@@ -252,7 +255,7 @@ func TestFSReplaceCommitsNewGenerationAndDeleteRemovesResource(t *testing.T) {
 	require.NoError(t, fs.Images().Create(context.Background(), old))
 	dir := filepath.Join(root, "images", testID)
 	oldGeneration := decodeMetadata(t, filepath.Join(dir, "metadata.json"))["content_filename"].(string)
-	replacement := imageDomain.Image{ID: testID, Extension: ".jpg", MediaType: "image/jpeg", Content: []byte("new"), CreatedAt: old.CreatedAt, UpdatedAt: time.Unix(5, 6)}
+	replacement := imageDomain.Image{ID: testID, Extension: ".jpg", MediaType: "image/jpeg", Content: []byte("new"), CreatedAt: time.Unix(99, 100), UpdatedAt: time.Unix(5, 6)}
 
 	require.NoError(t, fs.Images().Replace(context.Background(), replacement))
 	got, err := fs.Images().Get(context.Background(), testID)
@@ -261,7 +264,7 @@ func TestFSReplaceCommitsNewGenerationAndDeleteRemovesResource(t *testing.T) {
 	require.Equal(t, replacement.Extension, got.Extension)
 	require.Equal(t, replacement.MediaType, got.MediaType)
 	require.Equal(t, replacement.Content, got.Content)
-	require.True(t, replacement.CreatedAt.Equal(got.CreatedAt))
+	require.True(t, old.CreatedAt.Equal(got.CreatedAt))
 	require.True(t, replacement.UpdatedAt.Equal(got.UpdatedAt))
 	require.Nil(t, got.ExpiresAt)
 	newGeneration := decodeMetadata(t, filepath.Join(dir, "metadata.json"))["content_filename"].(string)
@@ -274,6 +277,368 @@ func TestFSReplaceCommitsNewGenerationAndDeleteRemovesResource(t *testing.T) {
 	require.ErrorIs(t, err, os.ErrNotExist)
 	err = fs.Images().Delete(context.Background(), testID)
 	assertCodeWithoutRoot(t, err, common.CodeNotFound, root)
+}
+
+func TestFSConcurrentReadersObserveCompleteReplacementRecords(t *testing.T) {
+	fs := newTestFS(t, t.TempDir())
+	old := whiteboardDomain.Whiteboard{
+		ID: testID, Kind: whiteboardDomain.KindMarkdown, Source: []byte("old-markdown"),
+		CreatedAt: time.Unix(10, 11).UTC(), UpdatedAt: time.Unix(12, 13).UTC(),
+	}
+	replacement := whiteboardDomain.Whiteboard{
+		ID: testID, Kind: whiteboardDomain.KindHTML, Source: []byte("<p>new-html</p>"),
+		CreatedAt: time.Unix(99, 100).UTC(), UpdatedAt: time.Unix(14, 15).UTC(),
+	}
+	require.NoError(t, fs.Whiteboards().Create(context.Background(), old))
+
+	const readers = 50
+	const writers = 20
+	start := make(chan struct{})
+	errs := make(chan error, readers+writers)
+	var workers sync.WaitGroup
+	for range readers {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			<-start
+			for range writers {
+				got, err := fs.Whiteboards().Get(context.Background(), testID)
+				if err != nil {
+					errs <- err
+					return
+				}
+				oldComplete := got.Kind == old.Kind && string(got.Source) == string(old.Source) && got.UpdatedAt.Equal(old.UpdatedAt)
+				newComplete := got.Kind == replacement.Kind && string(got.Source) == string(replacement.Source) && got.UpdatedAt.Equal(replacement.UpdatedAt)
+				if (!oldComplete && !newComplete) || !got.CreatedAt.Equal(old.CreatedAt) {
+					errs <- fmt.Errorf("observed incomplete record: %#v", got)
+					return
+				}
+			}
+		}()
+	}
+	for range writers {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			<-start
+			if err := fs.Whiteboards().Replace(context.Background(), replacement); err != nil {
+				errs <- err
+			}
+		}()
+	}
+	close(start)
+	workers.Wait()
+	close(errs)
+	for err := range errs {
+		require.NoError(t, err)
+	}
+	got, err := fs.Whiteboards().Get(context.Background(), testID)
+	require.NoError(t, err)
+	require.Equal(t, replacement.Kind, got.Kind)
+	require.Equal(t, replacement.Source, got.Source)
+	require.True(t, old.CreatedAt.Equal(got.CreatedAt))
+}
+
+func TestFSUnrelatedResourceLocksDoNotBlockEachOther(t *testing.T) {
+	fs := newTestFS(t, t.TempDir())
+	first := whiteboardDomain.Whiteboard{ID: testID, Kind: whiteboardDomain.KindMarkdown, Source: []byte("first"), CreatedAt: time.Unix(1, 0), UpdatedAt: time.Unix(1, 0)}
+	second := whiteboardDomain.Whiteboard{ID: testID2, Kind: whiteboardDomain.KindMarkdown, Source: []byte("second"), CreatedAt: time.Unix(1, 0), UpdatedAt: time.Unix(1, 0)}
+	require.NoError(t, fs.Whiteboards().Create(context.Background(), first))
+	require.NoError(t, fs.Whiteboards().Create(context.Background(), second))
+
+	release, err := fs.locks.lock(context.Background(), resourceLockKey("whiteboards", testID))
+	require.NoError(t, err)
+	defer release()
+	second.Source = []byte("updated independently")
+	second.UpdatedAt = time.Unix(2, 0)
+	done := make(chan error, 1)
+	go func() { done <- fs.Whiteboards().Replace(context.Background(), second) }()
+	select {
+	case err := <-done:
+		require.NoError(t, err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("replacement of unrelated ID blocked on held resource lock")
+	}
+}
+
+func TestLockSetCanceledWaiterReleasesReferenceAfterAcquiring(t *testing.T) {
+	locks := lockSet{entries: make(map[string]*lockEntry)}
+	releaseHeld, err := locks.lock(context.Background(), "whiteboards/"+testID)
+	require.NoError(t, err)
+	waitCtx, cancel := context.WithCancel(context.Background())
+	waitDone := make(chan error, 1)
+	go func() {
+		release, err := locks.lock(waitCtx, "whiteboards/"+testID)
+		if err == nil {
+			release()
+		}
+		waitDone <- err
+	}()
+	waitFor(t, 2*time.Second, func() bool { return lockRefs(&locks, "whiteboards/"+testID) == 2 })
+	cancel()
+	select {
+	case err := <-waitDone:
+		t.Fatalf("standard mutex waiter returned before acquiring the lock: %v", err)
+	default:
+	}
+	releaseHeld()
+	select {
+	case err := <-waitDone:
+		require.ErrorIs(t, err, context.Canceled)
+	case <-time.After(2 * time.Second):
+		t.Fatal("canceled waiter did not return after acquiring the lock")
+	}
+	require.Zero(t, lockEntryCount(&locks))
+}
+
+func TestLockSetReadAndWriteEntriesAreRemovedAtZeroReferences(t *testing.T) {
+	locks := lockSet{entries: make(map[string]*lockEntry)}
+	releaseRead, err := locks.rlock(context.Background(), "images/"+testID)
+	require.NoError(t, err)
+	releaseWrite, err := locks.lock(context.Background(), "whiteboards/"+testID)
+	require.NoError(t, err)
+	require.Equal(t, 2, lockEntryCount(&locks))
+	releaseRead()
+	require.Equal(t, 1, lockEntryCount(&locks))
+	releaseWrite()
+	require.Zero(t, lockEntryCount(&locks))
+}
+
+func TestFSLazilyDeletesExpiredResourcesAsNotFound(t *testing.T) {
+	tests := []struct {
+		name string
+		run  func(*FS) error
+	}{
+		{name: "get", run: func(fs *FS) error {
+			_, err := fs.Whiteboards().Get(context.Background(), testID)
+			return err
+		}},
+		{name: "replace", run: func(fs *FS) error {
+			return fs.Whiteboards().Replace(context.Background(), whiteboardDomain.Whiteboard{
+				ID: testID, Kind: whiteboardDomain.KindHTML, Source: []byte("replacement"),
+				CreatedAt: time.Unix(20, 0), UpdatedAt: time.Unix(21, 0),
+			})
+		}},
+		{name: "delete", run: func(fs *FS) error {
+			return fs.Whiteboards().Delete(context.Background(), testID)
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			now := time.Unix(1_700_000_000, 0).UTC()
+			clock := &testClock{now: now}
+			root := t.TempDir()
+			fs := newTestFSWithClock(t, root, clock, time.Hour)
+			record := whiteboardDomain.Whiteboard{
+				ID: testID, Kind: whiteboardDomain.KindMarkdown, Source: []byte("expired"),
+				CreatedAt: now.Add(-time.Hour), UpdatedAt: now.Add(-time.Minute), ExpiresAt: &now,
+			}
+			require.NoError(t, fs.Whiteboards().Create(context.Background(), record))
+
+			err := tt.run(fs)
+			assertCodeWithoutRoot(t, err, common.CodeNotFound, root)
+			_, statErr := os.Stat(filepath.Join(root, "whiteboards", testID))
+			require.ErrorIs(t, statErr, os.ErrNotExist)
+		})
+	}
+}
+
+func TestFSPeriodicCleanupDeletesExpiredResources(t *testing.T) {
+	start := time.Unix(1_700_000_000, 0).UTC()
+	clock := &testClock{now: start}
+	root := t.TempDir()
+	fs := newTestFSWithClock(t, root, clock, 5*time.Millisecond)
+	expires := start.Add(time.Second)
+	record := imageDomain.Image{
+		ID: testID, Extension: ".png", MediaType: "image/png", Content: []byte("expires periodically"),
+		CreatedAt: start, UpdatedAt: start, ExpiresAt: &expires,
+	}
+	require.NoError(t, fs.Images().Create(context.Background(), record))
+	clock.Set(expires)
+
+	resourceDir := filepath.Join(root, "images", testID)
+	waitFor(t, 2*time.Second, func() bool {
+		_, err := os.Stat(resourceDir)
+		return errors.Is(err, os.ErrNotExist)
+	})
+	_, err := fs.Images().Get(context.Background(), testID)
+	assertCodeWithoutRoot(t, err, common.CodeNotFound, root)
+}
+
+func TestFSCleanupSharesReadLockAndPreservesReferencedGeneration(t *testing.T) {
+	root := t.TempDir()
+	fs := newTestFS(t, root)
+	record := whiteboardDomain.Whiteboard{
+		ID: testID, Kind: whiteboardDomain.KindMarkdown, Source: []byte("referenced"),
+		CreatedAt: time.Unix(1, 0), UpdatedAt: time.Unix(1, 0),
+	}
+	require.NoError(t, fs.Whiteboards().Create(context.Background(), record))
+	resourceDir := filepath.Join(root, "whiteboards", testID)
+	referenced := decodeMetadata(t, filepath.Join(resourceDir, metadataFilename))["content_filename"].(string)
+	orphan := "source-11111111111111111111111111111111.md"
+	require.NoError(t, os.WriteFile(filepath.Join(resourceDir, orphan), []byte("orphan"), filePermissions))
+
+	key := resourceLockKey("whiteboards", testID)
+	releaseRead, err := fs.locks.rlock(context.Background(), key)
+	require.NoError(t, err)
+	sweepDone := make(chan struct{})
+	go func() {
+		fs.sweep(fs.ctx)
+		close(sweepDone)
+	}()
+	waitFor(t, 2*time.Second, func() bool { return lockRefs(&fs.locks, key) == 2 })
+	require.Equal(t, record.Source, readFile(t, filepath.Join(resourceDir, referenced)))
+	select {
+	case <-sweepDone:
+		t.Fatal("cleanup completed while the resource read lock was held")
+	default:
+	}
+	releaseRead()
+	select {
+	case <-sweepDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("cleanup did not resume after the read lock was released")
+	}
+	_, err = os.Stat(filepath.Join(resourceDir, orphan))
+	require.ErrorIs(t, err, os.ErrNotExist)
+	got, err := fs.Whiteboards().Get(context.Background(), testID)
+	require.NoError(t, err)
+	require.Equal(t, record.Source, got.Source)
+}
+
+func TestFSCleanupRemovesUnreferencedGenerationsAndTemps(t *testing.T) {
+	root := t.TempDir()
+	fs := newTestFS(t, root)
+	record := imageDomain.Image{
+		ID: testID, Extension: ".png", MediaType: "image/png", Content: []byte("referenced"),
+		CreatedAt: time.Unix(1, 0), UpdatedAt: time.Unix(1, 0),
+	}
+	require.NoError(t, fs.Images().Create(context.Background(), record))
+	resourceDir := filepath.Join(root, "images", testID)
+	referenced := decodeMetadata(t, filepath.Join(resourceDir, metadataFilename))["content_filename"].(string)
+	orphans := []string{
+		"content-11111111111111111111111111111111",
+		".content-temp-22222222222222222222222222222222",
+		".metadata-temp-33333333333333333333333333333333",
+	}
+	for _, name := range orphans {
+		require.NoError(t, os.WriteFile(filepath.Join(resourceDir, name), []byte("orphan"), filePermissions))
+	}
+
+	fs.sweep(fs.ctx)
+	for _, name := range orphans {
+		_, err := os.Stat(filepath.Join(resourceDir, name))
+		require.ErrorIs(t, err, os.ErrNotExist, name)
+	}
+	require.Equal(t, record.Content, readFile(t, filepath.Join(resourceDir, referenced)))
+	require.FileExists(t, filepath.Join(resourceDir, metadataFilename))
+}
+
+func TestFSCloseWaitsForActiveOperationAndRejectsNewOperations(t *testing.T) {
+	root := t.TempDir()
+	fs := newTestFS(t, root)
+	record := whiteboardDomain.Whiteboard{
+		ID: testID, Kind: whiteboardDomain.KindMarkdown, Source: []byte("held"),
+		CreatedAt: time.Unix(1, 0), UpdatedAt: time.Unix(1, 0),
+	}
+	require.NoError(t, fs.Whiteboards().Create(context.Background(), record))
+	key := resourceLockKey("whiteboards", testID)
+	releaseHeld, err := fs.locks.lock(context.Background(), key)
+	require.NoError(t, err)
+	operationDone := make(chan error, 1)
+	go func() {
+		_, err := fs.Whiteboards().Get(context.Background(), testID)
+		operationDone <- err
+	}()
+	waitFor(t, 2*time.Second, func() bool { return lockRefs(&fs.locks, key) == 2 })
+
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- fs.Close() }()
+	waitFor(t, 2*time.Second, func() bool { return fsClosing(fs) })
+	select {
+	case err := <-closeDone:
+		t.Fatalf("Close returned before active operation completed: %v", err)
+	default:
+	}
+
+	_, err = fs.Whiteboards().Get(context.Background(), "invalid")
+	assertCodeWithoutRoot(t, err, common.CodeStorageUnavailable, root)
+	err = fs.Whiteboards().Create(context.Background(), whiteboardDomain.Whiteboard{})
+	assertCodeWithoutRoot(t, err, common.CodeStorageUnavailable, root)
+	err = fs.Whiteboards().Replace(context.Background(), whiteboardDomain.Whiteboard{})
+	assertCodeWithoutRoot(t, err, common.CodeStorageUnavailable, root)
+	err = fs.Whiteboards().Delete(context.Background(), "invalid")
+	assertCodeWithoutRoot(t, err, common.CodeStorageUnavailable, root)
+	err = fs.Whiteboards().Ready(context.Background())
+	assertCodeWithoutRoot(t, err, common.CodeStorageUnavailable, root)
+
+	releaseHeld()
+	select {
+	case <-operationDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("blocked active operation did not return after lock release")
+	}
+	select {
+	case err := <-closeDone:
+		require.NoError(t, err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("Close did not return after active operation completed")
+	}
+}
+
+func TestFSConcurrentRepeatedCloseWaitsForOneCompletion(t *testing.T) {
+	fs := newTestFS(t, t.TempDir())
+	record := imageDomain.Image{
+		ID: testID, Extension: ".png", MediaType: "image/png", Content: []byte("held while closing"),
+		CreatedAt: time.Unix(1, 0), UpdatedAt: time.Unix(1, 0),
+	}
+	require.NoError(t, fs.Images().Create(context.Background(), record))
+	key := resourceLockKey("images", testID)
+	releaseHeld, err := fs.locks.lock(context.Background(), key)
+	require.NoError(t, err)
+	operationDone := make(chan struct{})
+	go func() {
+		_, _ = fs.Images().Get(context.Background(), testID)
+		close(operationDone)
+	}()
+	waitFor(t, 2*time.Second, func() bool { return lockRefs(&fs.locks, key) == 2 })
+
+	const callers = 32
+	start := make(chan struct{})
+	results := make(chan error, callers)
+	var callersDone sync.WaitGroup
+	for caller := range callers {
+		callersDone.Add(1)
+		go func(caller int) {
+			defer callersDone.Done()
+			<-start
+			if caller%2 == 0 {
+				results <- fs.Whiteboards().Close()
+				return
+			}
+			results <- fs.Images().Close()
+		}(caller)
+	}
+	close(start)
+	waitFor(t, 2*time.Second, func() bool { return fsClosing(fs) })
+	select {
+	case err := <-results:
+		releaseHeld()
+		t.Fatalf("concurrent Close returned before the shared completion point: %v", err)
+	default:
+	}
+	releaseHeld()
+	select {
+	case <-operationDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("active operation did not release concurrent Close callers")
+	}
+	callersDone.Wait()
+	close(results)
+	for err := range results {
+		require.NoError(t, err)
+	}
+	require.NoError(t, fs.Close())
 }
 
 func TestFSContextCancellationPreservesCommittedGeneration(t *testing.T) {
@@ -322,10 +687,71 @@ func TestFSReadinessAndSharedIdempotentClose(t *testing.T) {
 
 func newTestFS(t *testing.T, root string) *FS {
 	t.Helper()
-	fs, err := NewFS(Config{Root: root, CleanupInterval: time.Hour, Clock: common.SystemClock{}, Context: context.Background()})
+	return newTestFSWithClock(t, root, common.SystemClock{}, time.Hour)
+}
+
+func newTestFSWithClock(t *testing.T, root string, clock common.Clock, cleanupInterval time.Duration) *FS {
+	t.Helper()
+	fs, err := NewFS(Config{Root: root, CleanupInterval: cleanupInterval, Clock: clock, Context: context.Background()})
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, fs.Close()) })
 	return fs
+}
+
+type testClock struct {
+	mu  sync.Mutex
+	now time.Time
+}
+
+func (clock *testClock) Now() time.Time {
+	clock.mu.Lock()
+	defer clock.mu.Unlock()
+	return clock.now
+}
+
+func (clock *testClock) Set(now time.Time) {
+	clock.mu.Lock()
+	clock.now = now
+	clock.mu.Unlock()
+}
+
+func waitFor(t *testing.T, timeout time.Duration, condition func() bool) {
+	t.Helper()
+	deadline := time.NewTimer(timeout)
+	defer deadline.Stop()
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if condition() {
+			return
+		}
+		select {
+		case <-deadline.C:
+			t.Fatal("condition was not satisfied before deadline")
+		case <-ticker.C:
+		}
+	}
+}
+
+func lockRefs(locks *lockSet, key string) int {
+	locks.mu.Lock()
+	defer locks.mu.Unlock()
+	if entry := locks.entries[key]; entry != nil {
+		return entry.refs
+	}
+	return 0
+}
+
+func lockEntryCount(locks *lockSet) int {
+	locks.mu.Lock()
+	defer locks.mu.Unlock()
+	return len(locks.entries)
+}
+
+func fsClosing(fs *FS) bool {
+	fs.lifecycleMu.Lock()
+	defer fs.lifecycleMu.Unlock()
+	return fs.closing
 }
 
 func mustReadRootFile(t *testing.T, root *os.Root, name string) []byte {
