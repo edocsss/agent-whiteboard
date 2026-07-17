@@ -1,0 +1,100 @@
+package app
+
+import (
+	"context"
+	"errors"
+	"log/slog"
+	"os"
+	"path/filepath"
+	"testing"
+	"time"
+
+	"github.com/edocsss/agent-whiteboard/internal/image"
+	"github.com/edocsss/agent-whiteboard/internal/whiteboard"
+	"github.com/stretchr/testify/require"
+)
+
+func TestResolveServiceConfigUsesExactDefaults(t *testing.T) {
+	resolved, err := resolveServiceConfig(ServiceConfig{}, nil)
+	require.NoError(t, err)
+	home, err := os.UserHomeDir()
+	require.NoError(t, err)
+	require.Equal(t, filepath.Join(home, ".agent-whiteboard"), resolved.rootDir)
+	require.Equal(t, int64(86400), resolved.defaultExpiration)
+	require.Equal(t, 15*time.Minute, resolved.cleanupInterval)
+	require.Equal(t, "127.0.0.1", resolved.host)
+	require.Equal(t, 8567, resolved.port)
+	require.Equal(t, 10*time.Second, resolved.shutdownTimeout)
+	require.Equal(t, int64(10<<20), resolved.maxWhiteboardBytes)
+	require.Equal(t, int64(25<<20), resolved.maxImageBytes)
+	require.Equal(t, int64(100<<20), resolved.maxImageRequestBytes)
+	require.Equal(t, LogModeConsole, resolved.logMode)
+	require.IsType(t, &slog.TextHandler{}, resolved.logger.Handler())
+}
+
+func TestResolveServiceConfigHonorsExplicitZerosAndJSONLogging(t *testing.T) {
+	resolved, err := resolveServiceConfig(ServiceConfig{LogMode: LogModeJSON}, []Option{
+		WithPort(0),
+		WithDefaultExpiration(0),
+	})
+	require.NoError(t, err)
+	require.Zero(t, resolved.port)
+	require.Zero(t, resolved.defaultExpiration)
+	require.IsType(t, &slog.JSONHandler{}, resolved.logger.Handler())
+}
+
+func TestNewServiceResolvesHomeOnlyWhenFilesystemStorageIsNeeded(t *testing.T) {
+	originalUserHomeDir := userHomeDir
+	homeErr := errors.New("home unavailable")
+	homeCalls := 0
+	userHomeDir = func() (string, error) {
+		homeCalls++
+		return "", homeErr
+	}
+	t.Cleanup(func() { userHomeDir = originalUserHomeDir })
+
+	whiteboards := &serviceConfigWhiteboardStore{}
+	images := &serviceConfigImageStore{}
+	service, err := NewService(ServiceConfig{WhiteboardStore: whiteboards, ImageStore: images})
+	require.NoError(t, err)
+	require.NotNil(t, service)
+	require.Zero(t, homeCalls)
+	require.NoError(t, service.Close())
+
+	customWhiteboards := &serviceConfigWhiteboardStore{}
+	service, err = NewService(ServiceConfig{WhiteboardStore: customWhiteboards})
+	require.Nil(t, service)
+	require.ErrorIs(t, err, homeErr)
+	require.Equal(t, 1, homeCalls)
+	require.Zero(t, customWhiteboards.closeCalls)
+}
+
+type serviceConfigWhiteboardStore struct{ closeCalls int }
+
+func (*serviceConfigWhiteboardStore) Create(context.Context, whiteboard.Whiteboard) error { return nil }
+func (*serviceConfigWhiteboardStore) Get(context.Context, string) (whiteboard.Whiteboard, error) {
+	return whiteboard.Whiteboard{}, nil
+}
+func (*serviceConfigWhiteboardStore) Replace(context.Context, whiteboard.Whiteboard) error {
+	return nil
+}
+func (*serviceConfigWhiteboardStore) Delete(context.Context, string) error { return nil }
+func (*serviceConfigWhiteboardStore) Ready(context.Context) error          { return nil }
+func (store *serviceConfigWhiteboardStore) Close() error {
+	store.closeCalls++
+	return nil
+}
+
+type serviceConfigImageStore struct{ closeCalls int }
+
+func (*serviceConfigImageStore) Create(context.Context, image.Image) error { return nil }
+func (*serviceConfigImageStore) Get(context.Context, string) (image.Image, error) {
+	return image.Image{}, nil
+}
+func (*serviceConfigImageStore) Replace(context.Context, image.Image) error { return nil }
+func (*serviceConfigImageStore) Delete(context.Context, string) error       { return nil }
+func (*serviceConfigImageStore) Ready(context.Context) error                { return nil }
+func (store *serviceConfigImageStore) Close() error {
+	store.closeCalls++
+	return nil
+}
