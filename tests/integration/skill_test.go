@@ -53,7 +53,6 @@ func TestAgentSkillContract(t *testing.T) {
 
 	lower := strings.ToLower(body)
 	for _, prohibition := range []string{
-		"never open",
 		"credentials",
 		"tokens",
 		"personal",
@@ -69,6 +68,25 @@ func TestAgentSkillContract(t *testing.T) {
 	} {
 		require.Contains(t, lower, prohibition, "SKILL.md must state required contract %q", prohibition)
 	}
+
+	for _, renderingRequirement := range []string{
+		"ui/ux",
+		"frontend-design",
+		"headless-browser",
+		"browser-automation",
+		"markdown, mermaid, or standalone html",
+		"do not return the final url until verification succeeds",
+	} {
+		require.Contains(t, lower, renderingRequirement,
+			"SKILL.md must state rendering requirement %q", renderingRequirement)
+	}
+
+	securityPath := filepath.Join(skillDir, "references", "security.md")
+	securityContent, err := os.ReadFile(securityPath)
+	require.NoError(t, err)
+	require.NotContains(t, strings.ToLower(string(securityContent)),
+		"return the generated url without opening a browser or fetching the published active document",
+		"security guidance must allow the skill's rendering verification workflow")
 }
 
 func splitSkillFrontmatter(t *testing.T, content string) (map[string]string, string) {

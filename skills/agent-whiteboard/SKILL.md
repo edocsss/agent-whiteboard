@@ -5,7 +5,7 @@ description: Use when an agent needs to publish Markdown, Mermaid diagrams, trus
 
 # Agent Whiteboard
 
-Publish through the CLI whenever shell execution is available. Use direct HTTP only when the CLI cannot run. Return public URLs to the user; never open a browser yourself.
+Publish through the CLI whenever shell execution is available. Use direct HTTP only when the CLI cannot run. Return the final public URLs to the user after completing the verification below.
 
 ## Choose the resource
 
@@ -16,6 +16,14 @@ Publish through the CLI whenever shell execution is available. Use direct HTTP o
 Respect the configured limits; defaults are 10 MiB per whiteboard, 25 MiB per image, and 100 MiB for the complete image request.
 
 When Markdown uses local images, publish every image first, capture each returned absolute URL, and insert those URLs into the Markdown before publishing it. The service does not bundle local dependencies.
+
+## Author and verify rendered content
+
+Before creating standalone HTML, check for installed UI/UX or frontend-design skills. When a relevant skill is available, invoke it and use its guidance when designing the content.
+
+After publishing Markdown, Mermaid, or standalone HTML, check for available headless-browser or browser-automation skills and tools. When available, use them to open the returned URL and verify that the content is readable, correctly laid out, and functioning as intended.
+
+If verification finds an issue, update the source, republish it, and verify again. Do not return the final URL until verification succeeds.
 
 ## Publish safely
 
@@ -32,7 +40,7 @@ When Markdown uses local images, publish every image first, capture each returne
    - `agent-whiteboard image upload`
    - `agent-whiteboard image update`
    - `agent-whiteboard image delete`
-4. Read stdout or the JSON result, capture the public URL and capability ID, and return the URL without opening it.
+4. Read stdout or the JSON result and capture the public URL and capability ID. Complete any available rendering verification before returning the final URL.
 5. Use the capability ID to update or delete. There is no separate edit token.
 
 Public URLs are bearer capabilities: anyone with one can read it and derive the ID used for mutation. `noindex` limits discovery but is not authorization. Do not assume authentication, secrecy, or revocation beyond deletion.
