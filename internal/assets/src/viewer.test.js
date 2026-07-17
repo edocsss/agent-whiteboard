@@ -243,7 +243,7 @@ describe("Mermaid rendering", () => {
         startOnLoad: false,
         securityLevel: "strict",
         theme: "dark",
-        flowchart: { htmlLabels: false },
+        htmlLabels: false,
         secure: expect.arrayContaining([
           "secure",
           "securityLevel",
@@ -252,6 +252,7 @@ describe("Mermaid rendering", () => {
           "suppressErrorRendering",
           "maxEdges",
           "theme",
+          "htmlLabels",
           "themeCSS",
           "themeVariables",
         ]),

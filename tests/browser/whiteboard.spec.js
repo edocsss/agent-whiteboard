@@ -61,6 +61,8 @@ test("renders the complete Markdown contract without external requests", async (
   await expect(page.locator('a[href^="javascript:"]')).toHaveCount(0);
 
   await waitForDiagrams(page, 2);
+  await expect(page.locator(".mermaid-placeholder").nth(0)).toContainText("First");
+  await expect(page.locator(".mermaid-placeholder").nth(0)).toContainText("Second");
   for (const diagram of await page.locator(".mermaid-placeholder").all()) {
     await expect(diagram.locator("svg")).toHaveCount(1);
     await expect(diagram.locator("script")).toHaveCount(0);
