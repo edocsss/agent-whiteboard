@@ -87,7 +87,7 @@ func (h *Handler) create(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) update(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	if err := common.ValidateID(id); err != nil {
-		httpx.WriteError(w, err)
+		httpx.WriteError(w, notFound())
 		return
 	}
 
@@ -119,7 +119,7 @@ func (h *Handler) update(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) delete(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	if err := common.ValidateID(id); err != nil {
-		httpx.WriteError(w, err)
+		httpx.WriteError(w, notFound())
 		return
 	}
 	if err := h.operations.Delete(r.Context(), id); err != nil {
@@ -134,7 +134,7 @@ func (h *Handler) view(w http.ResponseWriter, r *http.Request) {
 	httpx.SetPublicHeaders(w, true)
 	id := r.PathValue("id")
 	if err := common.ValidateID(id); err != nil {
-		httpx.WriteError(w, err)
+		httpx.WriteError(w, notFound())
 		return
 	}
 

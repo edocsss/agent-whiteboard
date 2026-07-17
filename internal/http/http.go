@@ -20,6 +20,8 @@ const (
 	PublicMarkdown        = "/whiteboards/markdown/"
 	PublicHTML            = "/whiteboards/html/"
 	PublicImages          = "/images/"
+
+	maxExpirationFieldBytes int64 = 20
 )
 
 type ErrorBody struct {
@@ -131,18 +133,28 @@ func ReadMultipart(
 
 		fieldName := part.FormName()
 		filename := part.FileName()
-		content, readErr := ReadPart(part, partLimit)
-		closeErr := part.Close()
-		if readErr != nil {
-			return MultipartForm{}, readErr
-		}
-		if closeErr != nil {
-			return MultipartForm{}, multipartReadError(closeErr)
-		}
 
 		if fieldName == "expires_in_seconds" {
 			if filename != "" || form.ExpiresInSeconds != nil {
 				return MultipartForm{}, invalidRequest("duplicate or invalid expires_in_seconds", nil)
+			}
+			content, readErr := ReadPart(part, maxExpirationFieldBytes)
+			closeErr := part.Close()
+			if readErr != nil {
+				var maxBytesErr *standardhttp.MaxBytesError
+				if errors.As(readErr, &maxBytesErr) {
+					return MultipartForm{}, readErr
+				}
+				if closeErr != nil {
+					return MultipartForm{}, multipartReadError(closeErr)
+				}
+				if common.HasCode(readErr, common.CodeContentTooLarge) {
+					return MultipartForm{}, invalidRequest("invalid expires_in_seconds", readErr)
+				}
+				return MultipartForm{}, readErr
+			}
+			if closeErr != nil {
+				return MultipartForm{}, multipartReadError(closeErr)
 			}
 			expires, parseErr := strconv.ParseInt(string(content), 10, 64)
 			if parseErr != nil {
@@ -154,6 +166,14 @@ func ReadMultipart(
 
 		if _, ok := allowed[fieldName]; !ok || filename == "" {
 			return MultipartForm{}, invalidRequest("unexpected multipart field", nil)
+		}
+		content, readErr := ReadPart(part, partLimit)
+		closeErr := part.Close()
+		if readErr != nil {
+			return MultipartForm{}, readErr
+		}
+		if closeErr != nil {
+			return MultipartForm{}, multipartReadError(closeErr)
 		}
 		form.Files = append(form.Files, MultipartFile{
 			FieldName: fieldName,

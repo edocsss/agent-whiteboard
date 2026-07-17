@@ -196,6 +196,26 @@ func TestHandlerRejectsPerImageAndAggregateLimitsBeforeServiceCalls(t *testing.T
 	})
 }
 
+func TestHandlerImageLimitDoesNotApplyToExpirationField(t *testing.T) {
+	expiresIn := int64(60)
+	operations := mocks.NewMockOperations(t)
+	operations.EXPECT().CreateImages(mock.Anything, mock.MatchedBy(func(got image.CreateInput) bool {
+		return len(got.Images) == 1 && bytes.Equal(got.Images[0].Content, []byte("x")) &&
+			got.Images[0].ExpiresInSeconds != nil && *got.Images[0].ExpiresInSeconds == expiresIn
+	})).Return([]image.Result{{ID: testImageID, Extension: ".png", MediaType: "image/png"}}, nil).Once()
+	body, contentType := multipartRequestBody(t,
+		multipartField{name: "images", filename: "image.png", value: "x"},
+		multipartField{name: "expires_in_seconds", value: "60"},
+	)
+	req := httptest.NewRequest(http.MethodPost, httpx.APIImages, bytes.NewReader(body))
+	req.Header.Set("Content-Type", contentType)
+	rr := httptest.NewRecorder()
+
+	newMux(t, newHandler(t, operations, 1, int64(len(body)))).ServeHTTP(rr, req)
+
+	require.Equal(t, http.StatusCreated, rr.Code)
+}
+
 func TestHandlerPassesSignedExpirationAndMapsCreateErrors(t *testing.T) {
 	expiresIn := int64(-1)
 	ctx := context.WithValue(context.Background(), handlerContextKey{}, "sentinel")
@@ -326,7 +346,7 @@ func TestHandlerMapsMutationServiceErrorsAndCancellation(t *testing.T) {
 	})
 }
 
-func TestHandlerRejectsMalformedIDsBeforeReadingFormsOrCallingService(t *testing.T) {
+func TestHandlerHidesMalformedCapabilityIDsAsNotFoundBeforeCallingService(t *testing.T) {
 	for _, method := range []string{http.MethodPut, http.MethodDelete, http.MethodGet} {
 		t.Run(method, func(t *testing.T) {
 			operations := mocks.NewMockOperations(t)
@@ -339,8 +359,10 @@ func TestHandlerRejectsMalformedIDsBeforeReadingFormsOrCallingService(t *testing
 
 			newMux(t, newHandler(t, operations, defaultImageLimit, defaultRequestLimit)).ServeHTTP(rr, req)
 
-			require.Equal(t, http.StatusBadRequest, rr.Code)
-			require.Equal(t, httpx.ErrorBody{Code: common.CodeInvalidRequest, Message: "invalid resource id"}, decodeError(t, rr))
+			require.Equal(t, http.StatusNotFound, rr.Code)
+			require.Equal(t, "{\"error\":{\"code\":\"not_found\",\"message\":\"resource not found\"}}\n", rr.Body.String())
+			require.NotContains(t, rr.Body.String(), "invalid")
+			require.NotContains(t, rr.Body.String(), "malformed")
 		})
 	}
 }

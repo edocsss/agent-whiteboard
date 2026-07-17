@@ -238,6 +238,49 @@ func TestReadMultipartParsesSignedExpiration(t *testing.T) {
 	require.Equal(t, int64(-1), *form.ExpiresInSeconds)
 }
 
+func TestReadMultipartParsesSignedExpirationBoundsIndependentlyOfFileLimit(t *testing.T) {
+	tests := []struct {
+		name  string
+		value string
+		want  int64
+	}{
+		{name: "maximum", value: "9223372036854775807", want: int64(9223372036854775807)},
+		{name: "minimum", value: "-9223372036854775808", want: int64(-9223372036854775807 - 1)},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			body, contentType := multipartBody(t, []multipartValue{
+				{fieldName: "file", filename: "image.png", content: "x"},
+				{fieldName: "expires_in_seconds", content: tt.value},
+			})
+			req := httptest.NewRequest(http.MethodPost, "/", bytes.NewReader(body))
+			req.Header.Set("Content-Type", contentType)
+
+			form, err := httpx.ReadMultipart(httptest.NewRecorder(), req, int64(len(body)), 1, "file")
+
+			require.NoError(t, err)
+			require.Len(t, form.Files, 1)
+			require.Equal(t, []byte("x"), form.Files[0].Content)
+			require.Equal(t, tt.want, *form.ExpiresInSeconds)
+		})
+	}
+}
+
+func TestReadMultipartRejectsOversizedExpirationAsInvalidRequest(t *testing.T) {
+	body, contentType := multipartBody(t, []multipartValue{
+		{fieldName: "file", filename: "image.png", content: "x"},
+		{fieldName: "expires_in_seconds", content: "-92233720368547758080"},
+	})
+	req := httptest.NewRequest(http.MethodPost, "/", bytes.NewReader(body))
+	req.Header.Set("Content-Type", contentType)
+
+	_, err := httpx.ReadMultipart(httptest.NewRecorder(), req, int64(len(body)), 1, "file")
+
+	require.Error(t, err)
+	require.True(t, common.HasCode(err, common.CodeInvalidRequest), "expected invalid_request, got %v", err)
+}
+
 func TestReadMultipartLeavesOmittedExpirationNil(t *testing.T) {
 	body, contentType := multipartBody(t, []multipartValue{
 		{fieldName: "file", filename: "board.md", content: "content"},
