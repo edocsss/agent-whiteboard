@@ -118,3 +118,77 @@ func TestManifestContainsOnlyLocalAssetNames(t *testing.T) {
 		t.Fatal("manifest contains an external URL")
 	}
 }
+
+func TestThirdPartyNoticesContainExactBrowserDependencyMetadata(t *testing.T) {
+	t.Parallel()
+
+	notices := string(ThirdPartyNotices())
+	dependencies := []struct {
+		name      string
+		version   string
+		license   string
+		copyright string
+		upstream  string
+	}{
+		{
+			name:      "markdown-it",
+			version:   "14.2.0",
+			license:   "MIT",
+			copyright: "Copyright (c) 2014 Vitaly Puzrin, Alex Kocharin.",
+			upstream:  "https://github.com/markdown-it/markdown-it",
+		},
+		{
+			name:      "DOMPurify",
+			version:   "3.4.12",
+			license:   "(MPL-2.0 OR Apache-2.0)",
+			copyright: "(c) Cure53 and other contributors",
+			upstream:  "https://github.com/cure53/DOMPurify",
+		},
+		{
+			name:      "Mermaid",
+			version:   "11.15.0",
+			license:   "MIT",
+			copyright: "Copyright (c) 2014 - 2022 Knut Sveidqvist",
+			upstream:  "https://github.com/mermaid-js/mermaid",
+		},
+		{
+			name:      "highlight.js",
+			version:   "11.11.1",
+			license:   "BSD-3-Clause",
+			copyright: "Copyright (c) 2006, Ivan Sagalaev.",
+			upstream:  "https://github.com/highlightjs/highlight.js",
+		},
+	}
+
+	if notices == "" {
+		t.Fatal("embedded third-party notices are empty")
+	}
+	for _, dependency := range dependencies {
+		t.Run(dependency.name, func(t *testing.T) {
+			for field, want := range map[string]string{
+				"name": dependency.name, "version": dependency.version,
+				"license": dependency.license, "copyright": dependency.copyright,
+				"upstream URL": dependency.upstream,
+			} {
+				if !strings.Contains(notices, want) {
+					t.Errorf("third-party notices do not contain exact %s %q", field, want)
+				}
+			}
+		})
+	}
+}
+
+func TestThirdPartyNoticesReturnsFreshCopies(t *testing.T) {
+	t.Parallel()
+
+	first := ThirdPartyNotices()
+	second := ThirdPartyNotices()
+	if len(first) == 0 || len(second) == 0 {
+		t.Fatal("embedded third-party notices are empty")
+	}
+	original := second[0]
+	first[0] ^= 0xff
+	if second[0] != original || ThirdPartyNotices()[0] != original {
+		t.Fatal("mutating a result changed embedded third-party notices")
+	}
+}
