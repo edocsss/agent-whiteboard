@@ -1,0 +1,136 @@
+package cli
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"strconv"
+	"time"
+
+	"github.com/edocsss/agent-whiteboard/internal/common"
+	"github.com/edocsss/agent-whiteboard/internal/http"
+)
+
+type jsonResource struct {
+	ID        string `json:"id"`
+	URL       string `json:"url"`
+	ExpiresAt *int64 `json:"expires_at"`
+	Permanent bool   `json:"permanent"`
+}
+
+type singleResourceOutput struct {
+	SchemaVersion int          `json:"schema_version"`
+	Resource      jsonResource `json:"resource"`
+}
+
+type multiResourceOutput struct {
+	SchemaVersion int            `json:"schema_version"`
+	Resources     []jsonResource `json:"resources"`
+}
+
+type deleteOutput struct {
+	SchemaVersion int `json:"schema_version"`
+}
+
+type jsonErrorBody struct {
+	Code    string `json:"code"`
+	Message string `json:"message"`
+}
+
+type jsonErrorOutput struct {
+	SchemaVersion int           `json:"schema_version"`
+	Error         jsonErrorBody `json:"error"`
+}
+
+func writeResources(writer io.Writer, jsonMode bool, client Client, resources []http.Resource) error {
+	resolved := make([]jsonResource, 0, len(resources))
+	for _, resource := range resources {
+		publicURL, err := client.PublicURL(resource.Path)
+		if err != nil {
+			return err
+		}
+		resolved = append(resolved, jsonResource{
+			ID: resource.ID, URL: publicURL, ExpiresAt: resource.ExpiresAt, Permanent: resource.Permanent,
+		})
+	}
+
+	var output bytes.Buffer
+	if jsonMode {
+		encoder := json.NewEncoder(&output)
+		if len(resolved) == 1 {
+			if err := encoder.Encode(singleResourceOutput{SchemaVersion: 1, Resource: resolved[0]}); err != nil {
+				return err
+			}
+		} else if err := encoder.Encode(multiResourceOutput{SchemaVersion: 1, Resources: resolved}); err != nil {
+			return err
+		}
+	} else {
+		for _, resource := range resolved {
+			fmt.Fprintln(&output, resource.URL)
+		}
+	}
+	_, err := writer.Write(output.Bytes())
+	return err
+}
+
+func writeDeleteSuccess(writer io.Writer, jsonMode bool) error {
+	if !jsonMode {
+		return nil
+	}
+	return json.NewEncoder(writer).Encode(deleteOutput{SchemaVersion: 1})
+}
+
+func writeCommandError(stdout, stderr io.Writer, jsonMode bool, err error) {
+	_ = stdout
+	err = stableCommandError(err)
+	if jsonMode {
+		_ = json.NewEncoder(stderr).Encode(jsonErrorOutput{
+			SchemaVersion: 1,
+			Error:         jsonErrorBody{Code: commandErrorCode(err), Message: commandErrorMessage(err)},
+		})
+		return
+	}
+	fmt.Fprintf(stderr, "Error: %s\n", commandErrorMessage(err))
+}
+
+func commandErrorCode(err error) string {
+	switch {
+	case errors.Is(err, context.DeadlineExceeded):
+		return "timeout"
+	case errors.Is(err, context.Canceled):
+		return "canceled"
+	}
+	var domainErr *common.Error
+	if errors.As(err, &domainErr) {
+		return string(domainErr.Code)
+	}
+	return string(common.CodeInternal)
+}
+
+func commandErrorMessage(err error) string {
+	switch {
+	case errors.Is(err, context.DeadlineExceeded):
+		return "request timed out"
+	case errors.Is(err, context.Canceled):
+		return "request canceled"
+	}
+	var domainErr *common.Error
+	if errors.As(err, &domainErr) {
+		return domainErr.Message
+	}
+	return "internal error"
+}
+
+func humanExpiration(expiresAt *int64) string {
+	if expiresAt == nil {
+		return "permanent"
+	}
+	value := time.Unix(*expiresAt, 0).UTC()
+	if value.Year() < 0 || value.Year() > 9999 {
+		return strconv.FormatInt(*expiresAt, 10)
+	}
+	return value.Format(time.RFC3339)
+}
