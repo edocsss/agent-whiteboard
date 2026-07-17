@@ -345,6 +345,44 @@ func TestServerConcurrentCloseCallsPublishSameJoinedError(t *testing.T) {
 	require.Equal(t, int32(1), closer.calls.Load())
 }
 
+func TestServerCloseRacingActiveServeDoesNotStopHTTPOrDoubleClose(t *testing.T) {
+	application := newLifecycleApp(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
+		response.WriteHeader(http.StatusNoContent)
+	}))
+	listener := listenLocal(t)
+	closer := &blockingCloser{
+		entered: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	server := newTestServer(t, application, discardLogger(), listener, time.Second, closer)
+	serveCtx, cancelServe := context.WithCancel(context.Background())
+	serveDone := serveInBackground(server, serveCtx, listener)
+	var releaseCloser sync.Once
+	t.Cleanup(func() {
+		releaseCloser.Do(func() { close(closer.release) })
+		cancelServe()
+	})
+	waitForReady(t, application)
+
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- server.Close() }()
+	receive(t, closer.entered)
+	require.False(t, application.readiness.accepting.Load(), "Close left an active server ready")
+
+	response, err := serverTestHTTPClient().Get("http://" + listener.Addr().String())
+	require.NoError(t, err, "Close stopped HTTP serving")
+	require.Equal(t, http.StatusNoContent, response.StatusCode)
+	require.NoError(t, response.Body.Close())
+
+	releaseCloser.Do(func() { close(closer.release) })
+	require.NoError(t, receive(t, closeDone))
+	require.Equal(t, int32(1), closer.calls.Load())
+	cancelServe()
+	require.NoError(t, receive(t, serveDone))
+	require.False(t, application.readiness.accepting.Load())
+	require.Equal(t, int32(1), closer.calls.Load(), "Serve cancellation closed resources twice")
+}
+
 func TestServerDirectShutdownRacingCancellationDoesNotDeadlockOrDoubleClose(t *testing.T) {
 	requestEntered := make(chan struct{})
 	releaseRequest := make(chan struct{})

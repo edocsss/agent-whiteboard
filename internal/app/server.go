@@ -195,8 +195,9 @@ func (s *Server) serveClaimed(ctx context.Context, listener net.Listener) error 
 	defer cancelLog()
 	logDone := make(chan error, 1)
 	// Logging runs independently so cancellation and an early Serve exit cannot
-	// be hidden by a slow handler. Injected handlers that block must honor ctx;
-	// the buffered result still lets a late return finish without a goroutine leak.
+	// be hidden by a slow handler. Injected handlers that block should honor ctx.
+	// A handler that blocks forever and ignores ctx can retain this goroutine,
+	// although lifecycle progress no longer waits for it.
 	go func() {
 		logDone <- s.logListening(logCtx, address)
 	}()
