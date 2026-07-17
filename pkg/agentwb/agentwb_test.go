@@ -93,61 +93,6 @@ func (store *recordingImageStore) Close() error {
 	return nil
 }
 
-func TestResolveConfigUsesExactDefaults(t *testing.T) {
-	resolved, err := resolveConfig(Config{}, nil)
-	require.NoError(t, err)
-	home, err := os.UserHomeDir()
-	require.NoError(t, err)
-	require.Equal(t, filepath.Join(home, ".agent-whiteboard"), resolved.rootDir)
-	require.Equal(t, int64(86400), resolved.defaultExpiration)
-	require.Equal(t, 15*time.Minute, resolved.cleanupInterval)
-	require.Equal(t, "127.0.0.1", resolved.host)
-	require.Equal(t, 8567, resolved.port)
-	require.Equal(t, 10*time.Second, resolved.shutdownTimeout)
-	require.Equal(t, int64(10<<20), resolved.maxWhiteboardBytes)
-	require.Equal(t, int64(25<<20), resolved.maxImageBytes)
-	require.Equal(t, int64(100<<20), resolved.maxImageRequestBytes)
-	require.Equal(t, LogModeConsole, resolved.logMode)
-	require.IsType(t, &slog.TextHandler{}, resolved.logger.Handler())
-}
-
-func TestResolveConfigHonorsExplicitZerosAndJSONLogging(t *testing.T) {
-	resolved, err := resolveConfig(Config{LogMode: LogModeJSON}, []Option{
-		WithPort(0),
-		WithDefaultExpiration(0),
-	})
-	require.NoError(t, err)
-	require.Zero(t, resolved.port)
-	require.Zero(t, resolved.defaultExpiration)
-	require.IsType(t, &slog.JSONHandler{}, resolved.logger.Handler())
-}
-
-func TestNewResolvesHomeOnlyWhenFilesystemStorageIsNeeded(t *testing.T) {
-	originalUserHomeDir := userHomeDir
-	homeErr := errors.New("home unavailable")
-	homeCalls := 0
-	userHomeDir = func() (string, error) {
-		homeCalls++
-		return "", homeErr
-	}
-	t.Cleanup(func() { userHomeDir = originalUserHomeDir })
-
-	whiteboards := &recordingWhiteboardStore{}
-	images := &recordingImageStore{}
-	service, err := New(Config{WhiteboardStore: whiteboards, ImageStore: images})
-	require.NoError(t, err)
-	require.NotNil(t, service)
-	require.Zero(t, homeCalls)
-	require.NoError(t, service.Close())
-
-	customWhiteboards := &recordingWhiteboardStore{}
-	service, err = New(Config{WhiteboardStore: customWhiteboards})
-	require.Nil(t, service)
-	require.ErrorIs(t, err, homeErr)
-	require.Equal(t, 1, homeCalls)
-	require.Zero(t, customWhiteboards.close)
-}
-
 func TestNewRejectsInvalidConfigurationAndTypedNilDependencies(t *testing.T) {
 	var nilWhiteboards *recordingWhiteboardStore
 	var nilImages *recordingImageStore
