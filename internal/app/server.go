@@ -55,7 +55,7 @@ func NewServer(config ServerConfig) (*Server, error) {
 	if config.Logger == nil {
 		return nil, errors.New("server logger is required")
 	}
-	if !validServerHost(config.Host) {
+	if !ValidServerHost(config.Host) {
 		return nil, fmt.Errorf("invalid server host %q", config.Host)
 	}
 	if config.Port < 0 || config.Port > 65535 {
@@ -70,7 +70,7 @@ func NewServer(config ServerConfig) (*Server, error) {
 		}
 	}
 	if config.Listener != nil {
-		if err := validateListener(config.Listener); err != nil {
+		if err := ValidateListener(config.Listener); err != nil {
 			return nil, fmt.Errorf("invalid configured listener: %w", err)
 		}
 	}
@@ -117,7 +117,7 @@ func (s *Server) Serve(ctx context.Context, listener net.Listener) error {
 	if isNilInterface(ctx) {
 		return errors.New("serve context is required")
 	}
-	if err := validateListener(listener); err != nil {
+	if err := ValidateListener(listener); err != nil {
 		return err
 	}
 	if err := s.reserveServe(); err != nil {
@@ -299,7 +299,8 @@ func normalizeHTTPServerError(err error) error {
 	return err
 }
 
-func validateListener(listener net.Listener) error {
+// ValidateListener reports whether listener and its address can be used by a Server.
+func ValidateListener(listener net.Listener) error {
 	if isNilInterface(listener) {
 		return errors.New("listener is required")
 	}
@@ -309,7 +310,8 @@ func validateListener(listener net.Listener) error {
 	return nil
 }
 
-func validServerHost(host string) bool {
+// ValidServerHost reports whether host is a supported IP address or hostname.
+func ValidServerHost(host string) bool {
 	if host == "" || strings.TrimSpace(host) != host || strings.ContainsAny(host, "[]/\\") {
 		return false
 	}

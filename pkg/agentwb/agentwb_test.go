@@ -198,6 +198,9 @@ func TestNewPreflightsServerConfigurationBeforeTouchingStorage(t *testing.T) {
 		t.Run(test.name+" existing root", func(t *testing.T) {
 			root := filepath.Join(t.TempDir(), "existing")
 			require.NoError(t, os.Mkdir(root, 0o755))
+			beforeInfo, statErr := os.Stat(root)
+			require.NoError(t, statErr)
+			beforeMode := beforeInfo.Mode().Perm()
 			test.config.RootDir = root
 
 			service, err := New(test.config, test.options...)
@@ -207,7 +210,7 @@ func TestNewPreflightsServerConfigurationBeforeTouchingStorage(t *testing.T) {
 			require.True(t, HasErrorCode(err, CodeInvalidRequest), "expected invalid_request, got %v", err)
 			info, statErr := os.Stat(root)
 			require.NoError(t, statErr)
-			require.Equal(t, os.FileMode(0o755), info.Mode().Perm())
+			require.Equal(t, beforeMode, info.Mode().Perm())
 			require.NoDirExists(t, filepath.Join(root, "whiteboards"))
 			require.NoDirExists(t, filepath.Join(root, "images"))
 		})

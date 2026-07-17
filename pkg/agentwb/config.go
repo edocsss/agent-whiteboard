@@ -5,13 +5,12 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
-	"net/netip"
 	"os"
 	"path/filepath"
 	"reflect"
-	"strings"
 	"time"
 
+	"github.com/edocsss/agent-whiteboard/internal/app"
 	"github.com/edocsss/agent-whiteboard/internal/assets"
 	"github.com/edocsss/agent-whiteboard/internal/common"
 )
@@ -282,12 +281,18 @@ func validateResolvedConfig(
 	viewerCSS []byte,
 	viewerJS []byte,
 ) error {
+	if values.listenerSet {
+		if err := app.ValidateListener(values.listener); err != nil {
+			return invalidFacadeConfig("invalid listener")
+		}
+	}
+
 	switch {
 	case config.DefaultExpirationSeconds < 0 || defaultExpiration < 0:
 		return invalidFacadeConfig("default expiration must not be negative")
 	case config.CleanupInterval < 0 || cleanupInterval <= 0:
 		return invalidFacadeConfig("cleanup interval must be positive")
-	case !validFacadeHost(host):
+	case !app.ValidServerHost(host):
 		return invalidFacadeConfig("invalid server host")
 	case config.Port < 0 || config.Port > 65535 || port < 0 || port > 65535:
 		return invalidFacadeConfig("port must be between 0 and 65535")
@@ -307,10 +312,6 @@ func validateResolvedConfig(
 		return invalidFacadeConfig("clock is required")
 	case isNilValue(ids):
 		return invalidFacadeConfig("id generator is required")
-	case values.listenerSet && isNilValue(values.listener):
-		return invalidFacadeConfig("listener is required")
-	case values.listenerSet && isNilValue(values.listener.Addr()):
-		return invalidFacadeConfig("listener address is required")
 	case len(viewerCSS) == 0:
 		return invalidFacadeConfig("viewer CSS is required")
 	case len(viewerJS) == 0:
@@ -318,34 +319,6 @@ func validateResolvedConfig(
 	default:
 		return nil
 	}
-}
-
-// validFacadeHost mirrors the server's small, transport-independent host
-// constraint so invalid composition fails before a filesystem is opened.
-func validFacadeHost(host string) bool {
-	if host == "" || strings.TrimSpace(host) != host || strings.ContainsAny(host, "[]/\\") {
-		return false
-	}
-	if _, err := netip.ParseAddr(host); err == nil {
-		return true
-	}
-	if strings.Contains(host, ":") || len(host) > 253 {
-		return false
-	}
-	for _, label := range strings.Split(host, ".") {
-		if label == "" || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
-			return false
-		}
-		for _, character := range label {
-			if (character < 'a' || character > 'z') &&
-				(character < 'A' || character > 'Z') &&
-				(character < '0' || character > '9') &&
-				character != '-' {
-				return false
-			}
-		}
-	}
-	return true
 }
 
 func invalidFacadeConfig(message string) error {
