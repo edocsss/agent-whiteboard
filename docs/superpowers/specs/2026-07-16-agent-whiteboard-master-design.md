@@ -139,6 +139,7 @@ skills/agent-whiteboard/
 - `id.go`: cryptographically random ID generation and validation.
 - `expiration.go`: creation/update expiration calculation.
 - `errors.go`: stable domain error codes and wrapping.
+- `nil.go`: shared nil and typed-nil detection at dependency boundaries.
 
 `internal/whiteboard` owns Markdown and HTML models, service operations, its required storage interface, document validation, viewer-shell generation, and whiteboard HTTP handlers.
 
@@ -188,7 +189,7 @@ application, _ := app.New(app.Config{
 })
 ```
 
-The public `agentwb.New(Config, ...Option)` constructor chooses production defaults only when the caller omits optional overrides. Internal constructors require their dependencies explicitly and reject nil required dependencies.
+The internal application configuration resolver chooses production defaults only when optional overrides are omitted. The public `agentwb.New(Config, ...Option)` constructor is a thin forwarding facade over that composition root. Every API accepting `context.Context` requires a non-nil context and propagates valid contexts unchanged. Internal constructors require their dependencies explicitly and reject nil required dependencies.
 
 Mock boundaries are deliberately narrow:
 
