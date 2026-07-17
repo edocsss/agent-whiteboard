@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
@@ -10,7 +11,10 @@ import (
 	"time"
 
 	"github.com/edocsss/agent-whiteboard/internal/cli/mocks"
+	"github.com/edocsss/agent-whiteboard/internal/common"
 	httpx "github.com/edocsss/agent-whiteboard/internal/http"
+	"github.com/edocsss/agent-whiteboard/pkg/agentwb"
+	"github.com/spf13/cobra"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 )
@@ -33,7 +37,8 @@ func TestClientSettingsPrecedence(t *testing.T) {
 			client := mocks.NewMockClient(t)
 			root, err := NewRoot(Dependencies{
 				Stdout: io.Discard, Stderr: io.Discard, Getenv: mapGetenv(test.env),
-				NewClient: func(config httpx.ClientConfig) (Client, error) { got = config; return client, nil },
+				NewClient:      func(config httpx.ClientConfig) (Client, error) { got = config; return client, nil },
+				NewApplication: unusedApplication,
 			})
 			require.NoError(t, err)
 			client.EXPECT().DeleteImage(mock.Anything, "abc").Return(nil).Once()
@@ -95,7 +100,7 @@ func TestServerSettingsPrecedence(t *testing.T) {
 		{name: "flags", env: env, args: flagArgs, want: flags},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			root, err := NewRoot(Dependencies{Stdout: io.Discard, Stderr: io.Discard, Getenv: mapGetenv(test.env), NewClient: unusedClient})
+			root, err := NewRoot(Dependencies{Stdout: io.Discard, Stderr: io.Discard, Getenv: mapGetenv(test.env), NewClient: unusedClient, NewApplication: unusedApplication})
 			require.NoError(t, err)
 			root.SetArgs(append([]string{"serve"}, test.args...))
 			err = root.ExecuteContext(context.Background())
@@ -202,6 +207,10 @@ func TestValidationHappensBeforeClientCreation(t *testing.T) {
 		args []string
 	}{
 		{name: "invalid server", args: []string{"--server", "localhost:8567", "image", "delete", "abc"}},
+		{name: "server path", args: []string{"--server", "https://example.test/base", "image", "delete", "abc"}},
+		{name: "server query", args: []string{"--server", "https://example.test?x=1", "image", "delete", "abc"}},
+		{name: "server fragment", args: []string{"--server", "https://example.test#fragment", "image", "delete", "abc"}},
+		{name: "server empty fragment", args: []string{"--server", "https://example.test#", "image", "delete", "abc"}},
 		{name: "invalid timeout", args: []string{"--timeout", "zero", "image", "delete", "abc"}},
 		{name: "negative timeout", args: []string{"--timeout", "-1s", "image", "delete", "abc"}},
 		{name: "negative expiration", args: []string{"create", "markdown", "missing", "--expires-in", "-1"}},
@@ -213,7 +222,7 @@ func TestValidationHappensBeforeClientCreation(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			calls := 0
-			root, err := NewRoot(Dependencies{Stdout: io.Discard, Stderr: io.Discard, Getenv: mapGetenv(nil), NewClient: func(httpx.ClientConfig) (Client, error) { calls++; return mocks.NewMockClient(t), nil }})
+			root, err := NewRoot(Dependencies{Stdout: io.Discard, Stderr: io.Discard, Getenv: mapGetenv(nil), NewClient: func(httpx.ClientConfig) (Client, error) { calls++; return mocks.NewMockClient(t), nil }, NewApplication: unusedApplication})
 			require.NoError(t, err)
 			root.SetArgs(test.args)
 			require.Error(t, root.ExecuteContext(context.Background()))
@@ -222,12 +231,164 @@ func TestValidationHappensBeforeClientCreation(t *testing.T) {
 	}
 }
 
+func TestInvalidServerSettings(t *testing.T) {
+	tests := []struct {
+		name string
+		args []string
+	}{
+		{name: "port integer", args: []string{"--port", "nope"}},
+		{name: "port negative", args: []string{"--port", "-1"}},
+		{name: "port too large", args: []string{"--port", "65536"}},
+		{name: "cleanup duration", args: []string{"--cleanup-interval", "nope"}},
+		{name: "cleanup nonpositive", args: []string{"--cleanup-interval", "0s"}},
+		{name: "expiration integer", args: []string{"--default-expires-in", "nope"}},
+		{name: "expiration negative", args: []string{"--default-expires-in", "-1"}},
+		{name: "shutdown duration", args: []string{"--shutdown-timeout", "nope"}},
+		{name: "shutdown nonpositive", args: []string{"--shutdown-timeout", "0s"}},
+		{name: "whiteboard bytes integer", args: []string{"--max-whiteboard-bytes", "nope"}},
+		{name: "whiteboard bytes negative", args: []string{"--max-whiteboard-bytes", "-1"}},
+		{name: "image bytes integer", args: []string{"--max-image-bytes", "nope"}},
+		{name: "image bytes negative", args: []string{"--max-image-bytes", "-1"}},
+		{name: "request bytes integer", args: []string{"--max-image-request-bytes", "nope"}},
+		{name: "request bytes negative", args: []string{"--max-image-request-bytes", "-1"}},
+		{name: "request below image", args: []string{"--max-image-bytes", "2", "--max-image-request-bytes", "1"}},
+		{name: "host", args: []string{"--host", "bad host"}},
+		{name: "log mode", args: []string{"--log-mode", "xml"}},
+		{name: "storage", args: []string{"--storage", ""}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			root, err := NewRoot(validDependencies())
+			require.NoError(t, err)
+			root.SetArgs(append([]string{"serve"}, test.args...))
+			err = root.ExecuteContext(context.Background())
+			require.Error(t, err)
+			require.True(t, common.HasCode(err, common.CodeInvalidRequest), "error: %v", err)
+		})
+	}
+}
+
+func TestZeroServerLimitsRemainExplicit(t *testing.T) {
+	root, err := NewRoot(validDependencies())
+	require.NoError(t, err)
+	root.SetArgs([]string{"serve", "--max-image-request-bytes", "0"})
+	err = root.ExecuteContext(context.Background())
+	var boundary *serveNotImplementedError
+	require.ErrorAs(t, err, &boundary)
+	require.Zero(t, boundary.settings.maxImageRequestBytes)
+}
+
+func TestNewRootRejectsNilLikeDependencies(t *testing.T) {
+	var nilWriter *bytes.Buffer
+	tests := []struct {
+		name   string
+		mutate func(*Dependencies)
+	}{
+		{name: "stdout", mutate: func(deps *Dependencies) { deps.Stdout = nil }},
+		{name: "typed nil stdout", mutate: func(deps *Dependencies) { deps.Stdout = nilWriter }},
+		{name: "stderr", mutate: func(deps *Dependencies) { deps.Stderr = nil }},
+		{name: "typed nil stderr", mutate: func(deps *Dependencies) { deps.Stderr = nilWriter }},
+		{name: "getenv", mutate: func(deps *Dependencies) { deps.Getenv = nil }},
+		{name: "client factory", mutate: func(deps *Dependencies) { deps.NewClient = nil }},
+		{name: "application factory", mutate: func(deps *Dependencies) { deps.NewApplication = nil }},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			deps := validDependencies()
+			test.mutate(&deps)
+			_, err := NewRoot(deps)
+			require.Error(t, err)
+			require.True(t, common.HasCode(err, common.CodeInvalidRequest), "error: %v", err)
+		})
+	}
+}
+
+func TestCommandRejectsTypedNilClient(t *testing.T) {
+	var client *mocks.MockClient
+	deps := validDependencies()
+	deps.NewClient = func(httpx.ClientConfig) (Client, error) { return client, nil }
+	root, err := NewRoot(deps)
+	require.NoError(t, err)
+	root.SetArgs([]string{"image", "delete", "abc"})
+	require.NotPanics(t, func() { err = root.ExecuteContext(context.Background()) })
+	require.Error(t, err)
+	require.True(t, common.HasCode(err, common.CodeInvalidRequest), "error: %v", err)
+}
+
+func TestCommandTreeIsExact(t *testing.T) {
+	root, err := NewRoot(validDependencies())
+	require.NoError(t, err)
+	require.True(t, root.CompletionOptions.DisableDefaultCmd)
+	require.Equal(t, []string{"create", "delete", "image", "serve", "update"}, commandNames(root))
+	require.Equal(t, []string{"html", "markdown"}, commandNames(findCommand(t, root, "create")))
+	require.Equal(t, []string{"html", "markdown"}, commandNames(findCommand(t, root, "update")))
+	require.Equal(t, []string{"html", "markdown"}, commandNames(findCommand(t, root, "delete")))
+	require.Equal(t, []string{"delete", "update", "upload"}, commandNames(findCommand(t, root, "image")))
+}
+
+func TestSingleFileCommandsCloseHandles(t *testing.T) {
+	dir := t.TempDir()
+	fixture := writeFixture(t, dir, "fixture.md", "content")
+	tests := []struct {
+		name   string
+		args   []string
+		expect func(*mocks.MockClient, **os.File)
+	}{
+		{name: "create", args: []string{"create", "markdown", fixture}, expect: func(client *mocks.MockClient, captured **os.File) {
+			client.EXPECT().CreateWhiteboard(mock.Anything, httpx.WhiteboardMarkdown, mock.Anything, (*int64)(nil)).RunAndReturn(func(_ context.Context, _ httpx.WhiteboardKind, input httpx.File, _ *int64) (httpx.Resource, error) {
+				*captured = input.Reader.(*os.File)
+				return resource("abc", "/whiteboards/markdown/abc", nil), nil
+			}).Once()
+		}},
+		{name: "whiteboard update", args: []string{"update", "markdown", "abc", fixture}, expect: func(client *mocks.MockClient, captured **os.File) {
+			client.EXPECT().UpdateWhiteboard(mock.Anything, httpx.WhiteboardMarkdown, "abc", mock.Anything, (*int64)(nil)).RunAndReturn(func(_ context.Context, _ httpx.WhiteboardKind, _ string, input httpx.File, _ *int64) (httpx.Resource, error) {
+				*captured = input.Reader.(*os.File)
+				return resource("abc", "/whiteboards/markdown/abc", nil), nil
+			}).Once()
+		}},
+		{name: "image update", args: []string{"image", "update", "abc", fixture}, expect: func(client *mocks.MockClient, captured **os.File) {
+			client.EXPECT().UpdateImage(mock.Anything, "abc", mock.Anything, (*int64)(nil)).RunAndReturn(func(_ context.Context, _ string, input httpx.File, _ *int64) (httpx.Resource, error) {
+				*captured = input.Reader.(*os.File)
+				return resource("abc", "/images/abc", nil), nil
+			}).Once()
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			client := mocks.NewMockClient(t)
+			var captured *os.File
+			test.expect(client, &captured)
+			client.EXPECT().PublicURL(mock.Anything).Return("https://example.test/resource", nil).Once()
+			root := mustRoot(t, client, nil, io.Discard, io.Discard)
+			root.SetArgs(test.args)
+			require.NoError(t, root.ExecuteContext(context.Background()))
+			require.NotNil(t, captured)
+			_, err := captured.Stat()
+			require.ErrorIs(t, err, os.ErrClosed)
+		})
+	}
+}
+
+func TestImageUploadJSONAlwaysUsesResourcesArray(t *testing.T) {
+	fixture := writeFixture(t, t.TempDir(), "image.png", "content")
+	client := mocks.NewMockClient(t)
+	client.EXPECT().CreateImages(mock.Anything, mock.Anything, (*int64)(nil)).Return(
+		[]httpx.Resource{resource("id", "/images/id", nil)}, nil,
+	).Once()
+	client.EXPECT().PublicURL("/images/id").Return("https://example.test/images/id", nil).Once()
+	var stdout bytes.Buffer
+	root := mustRoot(t, client, nil, &stdout, io.Discard)
+	root.SetArgs([]string{"--json", "image", "upload", fixture})
+	require.NoError(t, root.ExecuteContext(context.Background()))
+	require.Equal(t, "{\"schema_version\":1,\"resources\":[{\"id\":\"id\",\"url\":\"https://example.test/images/id\",\"expires_at\":null,\"permanent\":true}]}\n", stdout.String())
+}
+
 func mustRoot(t *testing.T, client Client, getenv func(string) string, stdout, stderr io.Writer) interfaceRoot {
 	t.Helper()
 	if getenv == nil {
 		getenv = mapGetenv(nil)
 	}
-	root, err := NewRoot(Dependencies{Stdout: stdout, Stderr: stderr, Getenv: getenv, NewClient: func(httpx.ClientConfig) (Client, error) { return client, nil }})
+	root, err := NewRoot(Dependencies{Stdout: stdout, Stderr: stderr, Getenv: getenv, NewClient: func(httpx.ClientConfig) (Client, error) { return client, nil }, NewApplication: unusedApplication})
 	require.NoError(t, err)
 	return root
 }
@@ -282,6 +443,34 @@ func mapGetenv(values map[string]string) func(string) string {
 
 func unusedClient(httpx.ClientConfig) (Client, error) {
 	return nil, errors.New("client must not be created")
+}
+
+func unusedApplication(agentwb.Config, ...agentwb.Option) (Application, error) {
+	return nil, errors.New("application must not be created")
+}
+
+func validDependencies() Dependencies {
+	return Dependencies{Stdout: io.Discard, Stderr: io.Discard, Getenv: mapGetenv(nil), NewClient: unusedClient, NewApplication: unusedApplication}
+}
+
+func commandNames(command interface{ Commands() []*cobra.Command }) []string {
+	commands := command.Commands()
+	names := make([]string, 0, len(commands))
+	for _, child := range commands {
+		names = append(names, child.Name())
+	}
+	return names
+}
+
+func findCommand(t *testing.T, root *cobra.Command, name string) *cobra.Command {
+	t.Helper()
+	for _, command := range root.Commands() {
+		if command.Name() == name {
+			return command
+		}
+	}
+	t.Fatalf("command %q not found", name)
+	return nil
 }
 
 func int64Pointer(value int64) *int64 { return &value }

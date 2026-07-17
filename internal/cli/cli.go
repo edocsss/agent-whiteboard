@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"time"
@@ -84,17 +85,20 @@ type commandFactory struct {
 }
 
 func NewRoot(deps Dependencies) (*cobra.Command, error) {
-	if deps.Stdout == nil {
+	if isNilLike(deps.Stdout) {
 		return nil, invalidCommand("stdout is required")
 	}
-	if deps.Stderr == nil {
+	if isNilLike(deps.Stderr) {
 		return nil, invalidCommand("stderr is required")
 	}
-	if deps.Getenv == nil {
+	if isNilLike(deps.Getenv) {
 		return nil, invalidCommand("environment lookup is required")
 	}
-	if deps.NewClient == nil {
+	if isNilLike(deps.NewClient) {
 		return nil, invalidCommand("client factory is required")
+	}
+	if isNilLike(deps.NewApplication) {
+		return nil, invalidCommand("application factory is required")
 	}
 
 	options := &rootOptions{}
@@ -110,6 +114,7 @@ func NewRoot(deps Dependencies) (*cobra.Command, error) {
 	}
 	root.SetOut(deps.Stdout)
 	root.SetErr(deps.Stderr)
+	root.CompletionOptions.DisableDefaultCmd = true
 	root.PersistentFlags().StringVar(&options.server, "server", "", "server origin")
 	root.PersistentFlags().StringVar(&options.timeout, "timeout", "", "client timeout")
 	root.PersistentFlags().BoolVar(&options.json, "json", false, "write versioned JSON output")
@@ -133,7 +138,7 @@ func (factory commandFactory) newClient(cmd *cobra.Command) (Client, context.Con
 	if err != nil {
 		return nil, nil, nil, stableCommandError(err)
 	}
-	if client == nil {
+	if isNilLike(client) {
 		return nil, nil, nil, invalidCommand("client factory returned nil")
 	}
 	ctx, cancel := context.WithTimeout(cmd.Context(), settings.timeout)
@@ -167,6 +172,9 @@ func (factory commandFactory) resolveClientSettings(cmd *cobra.Command) (clientS
 }
 
 func validateServerOrigin(value string) error {
+	if strings.Contains(value, "#") {
+		return invalidCommand("server must be an absolute HTTP origin")
+	}
 	parsed, err := url.Parse(value)
 	if err != nil || parsed == nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" {
 		return invalidCommand("server must be an absolute HTTP origin")
@@ -254,10 +262,17 @@ func (factory commandFactory) resolveServerSettings(cmd *cobra.Command, flags *s
 		return resolvedServerSettings{}, invalidCommand("storage path is required")
 	case settings.logMode != "console" && settings.logMode != "json":
 		return resolvedServerSettings{}, invalidCommand("log mode must be console or json")
-	case settings.maxImageRequestBytes < settings.maxImageBytes:
+	case effectiveLimit(settings.maxImageRequestBytes, 100<<20) < effectiveLimit(settings.maxImageBytes, 25<<20):
 		return resolvedServerSettings{}, invalidCommand("max image request bytes must not be less than max image bytes")
 	}
 	return settings, nil
+}
+
+func effectiveLimit(value, defaultValue int64) int64 {
+	if value == 0 {
+		return defaultValue
+	}
+	return value
 }
 
 type serveNotImplementedError struct {
@@ -303,6 +318,19 @@ func parsePositiveDuration(value, field string) (time.Duration, error) {
 
 func invalidCommand(message string) error {
 	return common.NewError(common.CodeInvalidRequest, message, nil)
+}
+
+func isNilLike(value any) bool {
+	if value == nil {
+		return true
+	}
+	reflected := reflect.ValueOf(value)
+	switch reflected.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice:
+		return reflected.IsNil()
+	default:
+		return false
+	}
 }
 
 func stableCommandError(err error) error {

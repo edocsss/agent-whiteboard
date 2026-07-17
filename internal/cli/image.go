@@ -51,7 +51,7 @@ func (factory commandFactory) newImageUploadCommand() *cobra.Command {
 		if err != nil {
 			return stableCommandError(err)
 		}
-		return stableCommandError(writeResources(factory.deps.Stdout, factory.root.json, client, created))
+		return stableCommandError(writeResourceList(factory.deps.Stdout, factory.root.json, client, created))
 	}
 	return command
 }
@@ -79,7 +79,7 @@ func (factory commandFactory) newImageUpdateCommand() *cobra.Command {
 		if err != nil {
 			return stableCommandError(err)
 		}
-		return stableCommandError(writeResources(factory.deps.Stdout, factory.root.json, client, []http.Resource{updated}))
+		return stableCommandError(writeResource(factory.deps.Stdout, factory.root.json, client, updated))
 	}
 	return command
 }

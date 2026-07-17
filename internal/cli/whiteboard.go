@@ -35,7 +35,7 @@ func (factory commandFactory) newCreateWhiteboardCommand(name string, kind http.
 		if err != nil {
 			return stableCommandError(err)
 		}
-		return stableCommandError(writeResources(factory.deps.Stdout, factory.root.json, client, []http.Resource{created}))
+		return stableCommandError(writeResource(factory.deps.Stdout, factory.root.json, client, created))
 	}
 	return command
 }
@@ -70,7 +70,7 @@ func (factory commandFactory) newUpdateWhiteboardCommand(name string, kind http.
 		if err != nil {
 			return stableCommandError(err)
 		}
-		return stableCommandError(writeResources(factory.deps.Stdout, factory.root.json, client, []http.Resource{updated}))
+		return stableCommandError(writeResource(factory.deps.Stdout, factory.root.json, client, updated))
 	}
 	return command
 }

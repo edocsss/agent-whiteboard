@@ -45,26 +45,47 @@ type jsonErrorOutput struct {
 	Error         jsonErrorBody `json:"error"`
 }
 
-func writeResources(writer io.Writer, jsonMode bool, client Client, resources []http.Resource) error {
+func resolveJSONResources(client Client, resources []http.Resource) ([]jsonResource, error) {
 	resolved := make([]jsonResource, 0, len(resources))
 	for _, resource := range resources {
 		publicURL, err := client.PublicURL(resource.Path)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		resolved = append(resolved, jsonResource{
 			ID: resource.ID, URL: publicURL, ExpiresAt: resource.ExpiresAt, Permanent: resource.Permanent,
 		})
 	}
+	return resolved, nil
+}
+
+func writeResource(writer io.Writer, jsonMode bool, client Client, resource http.Resource) error {
+	resolved, err := resolveJSONResources(client, []http.Resource{resource})
+	if err != nil {
+		return err
+	}
 
 	var output bytes.Buffer
 	if jsonMode {
-		encoder := json.NewEncoder(&output)
-		if len(resolved) == 1 {
-			if err := encoder.Encode(singleResourceOutput{SchemaVersion: 1, Resource: resolved[0]}); err != nil {
-				return err
-			}
-		} else if err := encoder.Encode(multiResourceOutput{SchemaVersion: 1, Resources: resolved}); err != nil {
+		if err := json.NewEncoder(&output).Encode(singleResourceOutput{SchemaVersion: 1, Resource: resolved[0]}); err != nil {
+			return err
+		}
+	} else {
+		fmt.Fprintln(&output, resolved[0].URL)
+	}
+	_, err = writer.Write(output.Bytes())
+	return err
+}
+
+func writeResourceList(writer io.Writer, jsonMode bool, client Client, resources []http.Resource) error {
+	resolved, err := resolveJSONResources(client, resources)
+	if err != nil {
+		return err
+	}
+
+	var output bytes.Buffer
+	if jsonMode {
+		if err := json.NewEncoder(&output).Encode(multiResourceOutput{SchemaVersion: 1, Resources: resolved}); err != nil {
 			return err
 		}
 	} else {
@@ -72,7 +93,7 @@ func writeResources(writer io.Writer, jsonMode bool, client Client, resources []
 			fmt.Fprintln(&output, resource.URL)
 		}
 	}
-	_, err := writer.Write(output.Bytes())
+	_, err = writer.Write(output.Bytes())
 	return err
 }
 

@@ -19,7 +19,7 @@ func TestHumanSuccessWritesOnePublicURLPerLine(t *testing.T) {
 	client.EXPECT().PublicURL("/images/one").Return("https://example.test/images/one", nil).Once()
 	client.EXPECT().PublicURL("/images/two").Return("https://example.test/images/two", nil).Once()
 	var stdout bytes.Buffer
-	require.NoError(t, writeResources(&stdout, false, client, []httpx.Resource{
+	require.NoError(t, writeResourceList(&stdout, false, client, []httpx.Resource{
 		resource("one", "/images/one", nil), resource("two", "/images/two", int64Pointer(42)),
 	}))
 	require.Equal(t, "https://example.test/images/one\nhttps://example.test/images/two\n", stdout.String())
@@ -29,7 +29,7 @@ func TestJSONSuccessContract(t *testing.T) {
 	client := mocks.NewMockClient(t)
 	client.EXPECT().PublicURL("/images/id").Return("https://example.test/images/id", nil).Once()
 	var stdout bytes.Buffer
-	require.NoError(t, writeResources(&stdout, true, client, []httpx.Resource{resource("id", "/images/id", nil)}))
+	require.NoError(t, writeResource(&stdout, true, client, resource("id", "/images/id", nil)))
 	require.Equal(t, "{\"schema_version\":1,\"resource\":{\"id\":\"id\",\"url\":\"https://example.test/images/id\",\"expires_at\":null,\"permanent\":true}}\n", stdout.String())
 }
 
@@ -38,7 +38,7 @@ func TestJSONMultiImagePreservesOrder(t *testing.T) {
 	client.EXPECT().PublicURL("/images/two").Return("https://example.test/images/two", nil).Once()
 	client.EXPECT().PublicURL("/images/one").Return("https://example.test/images/one", nil).Once()
 	var stdout bytes.Buffer
-	require.NoError(t, writeResources(&stdout, true, client, []httpx.Resource{
+	require.NoError(t, writeResourceList(&stdout, true, client, []httpx.Resource{
 		resource("two", "/images/two", int64Pointer(22)), resource("one", "/images/one", nil),
 	}))
 	var body struct {
@@ -50,6 +50,14 @@ func TestJSONMultiImagePreservesOrder(t *testing.T) {
 	require.NoError(t, json.Unmarshal(stdout.Bytes(), &body))
 	require.Equal(t, 1, body.SchemaVersion)
 	require.Equal(t, []string{"two", "one"}, []string{body.Resources[0].ID, body.Resources[1].ID})
+}
+
+func TestJSONImageListUsesResourcesForOneImage(t *testing.T) {
+	client := mocks.NewMockClient(t)
+	client.EXPECT().PublicURL("/images/id").Return("https://example.test/images/id", nil).Once()
+	var stdout bytes.Buffer
+	require.NoError(t, writeResourceList(&stdout, true, client, []httpx.Resource{resource("id", "/images/id", nil)}))
+	require.Equal(t, "{\"schema_version\":1,\"resources\":[{\"id\":\"id\",\"url\":\"https://example.test/images/id\",\"expires_at\":null,\"permanent\":true}]}\n", stdout.String())
 }
 
 func TestErrorOutputUsesOnlyStderr(t *testing.T) {
