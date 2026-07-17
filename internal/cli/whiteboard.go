@@ -6,14 +6,14 @@ import (
 )
 
 func (factory commandFactory) newCreateCommand() *cobra.Command {
-	command := &cobra.Command{Use: "create", Args: cobra.NoArgs}
+	command := &cobra.Command{Use: "create", Args: usageArgs(cobra.NoArgs)}
 	command.AddCommand(factory.newCreateWhiteboardCommand("markdown", http.WhiteboardMarkdown))
 	command.AddCommand(factory.newCreateWhiteboardCommand("html", http.WhiteboardHTML))
 	return command
 }
 
 func (factory commandFactory) newCreateWhiteboardCommand(name string, kind http.WhiteboardKind) *cobra.Command {
-	command := &cobra.Command{Use: name + " <file>", Args: cobra.ExactArgs(1)}
+	command := &cobra.Command{Use: name + " <file>", Args: usageArgs(cobra.ExactArgs(1))}
 	expires := expirationFlag(command)
 	command.RunE = func(cmd *cobra.Command, args []string) error {
 		expiration, err := resolveExpiration(cmd, *expires)
@@ -41,14 +41,14 @@ func (factory commandFactory) newCreateWhiteboardCommand(name string, kind http.
 }
 
 func (factory commandFactory) newUpdateCommand() *cobra.Command {
-	command := &cobra.Command{Use: "update", Args: cobra.NoArgs}
+	command := &cobra.Command{Use: "update", Args: usageArgs(cobra.NoArgs)}
 	command.AddCommand(factory.newUpdateWhiteboardCommand("markdown", http.WhiteboardMarkdown))
 	command.AddCommand(factory.newUpdateWhiteboardCommand("html", http.WhiteboardHTML))
 	return command
 }
 
 func (factory commandFactory) newUpdateWhiteboardCommand(name string, kind http.WhiteboardKind) *cobra.Command {
-	command := &cobra.Command{Use: name + " <id> <file>", Args: cobra.ExactArgs(2)}
+	command := &cobra.Command{Use: name + " <id> <file>", Args: usageArgs(cobra.ExactArgs(2))}
 	expires := expirationFlag(command)
 	command.RunE = func(cmd *cobra.Command, args []string) error {
 		expiration, err := resolveExpiration(cmd, *expires)
@@ -76,7 +76,7 @@ func (factory commandFactory) newUpdateWhiteboardCommand(name string, kind http.
 }
 
 func (factory commandFactory) newDeleteCommand() *cobra.Command {
-	command := &cobra.Command{Use: "delete", Args: cobra.NoArgs}
+	command := &cobra.Command{Use: "delete", Args: usageArgs(cobra.NoArgs)}
 	command.AddCommand(factory.newDeleteWhiteboardCommand("markdown", http.WhiteboardMarkdown))
 	command.AddCommand(factory.newDeleteWhiteboardCommand("html", http.WhiteboardHTML))
 	return command
@@ -85,7 +85,7 @@ func (factory commandFactory) newDeleteCommand() *cobra.Command {
 func (factory commandFactory) newDeleteWhiteboardCommand(name string, kind http.WhiteboardKind) *cobra.Command {
 	return &cobra.Command{
 		Use:  name + " <id>",
-		Args: cobra.ExactArgs(1),
+		Args: usageArgs(cobra.ExactArgs(1)),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			client, ctx, cancel, err := factory.newClient(cmd)
 			if err != nil {

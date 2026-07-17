@@ -106,6 +106,9 @@ func writeDeleteSuccess(writer io.Writer, jsonMode bool) error {
 
 func writeCommandError(stdout, stderr io.Writer, jsonMode bool, err error) {
 	_ = stdout
+	if isNilLike(stderr) {
+		stderr = io.Discard
+	}
 	err = stableCommandError(err)
 	if jsonMode {
 		_ = json.NewEncoder(stderr).Encode(jsonErrorOutput{
@@ -118,11 +121,15 @@ func writeCommandError(stdout, stderr io.Writer, jsonMode bool, err error) {
 }
 
 func commandErrorCode(err error) string {
-	switch {
-	case errors.Is(err, context.DeadlineExceeded):
-		return "timeout"
-	case errors.Is(err, context.Canceled):
+	if contextErr, contextOnly := contextOnlyError(err); contextOnly {
+		if contextErr == context.DeadlineExceeded {
+			return "timeout"
+		}
 		return "canceled"
+	}
+	var usage usageError
+	if errors.As(err, &usage) {
+		return string(common.CodeInvalidRequest)
 	}
 	var domainErr *common.Error
 	if errors.As(err, &domainErr) {
@@ -132,11 +139,15 @@ func commandErrorCode(err error) string {
 }
 
 func commandErrorMessage(err error) string {
-	switch {
-	case errors.Is(err, context.DeadlineExceeded):
-		return "request timed out"
-	case errors.Is(err, context.Canceled):
+	if contextErr, contextOnly := contextOnlyError(err); contextOnly {
+		if contextErr == context.DeadlineExceeded {
+			return "request timed out"
+		}
 		return "request canceled"
+	}
+	var usage usageError
+	if errors.As(err, &usage) {
+		return usage.Error()
 	}
 	var domainErr *common.Error
 	if errors.As(err, &domainErr) {

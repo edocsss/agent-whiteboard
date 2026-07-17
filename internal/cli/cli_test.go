@@ -100,13 +100,20 @@ func TestServerSettingsPrecedence(t *testing.T) {
 		{name: "flags", env: env, args: flagArgs, want: flags},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			root, err := NewRoot(Dependencies{Stdout: io.Discard, Stderr: io.Discard, Getenv: mapGetenv(test.env), NewClient: unusedClient, NewApplication: unusedApplication})
+			wantConfig := buildApplicationArguments(test.want, io.Discard).config
+			wantConfig.Logger = nil
+			deps := Dependencies{Stdout: io.Discard, Stderr: io.Discard, Getenv: mapGetenv(test.env), NewClient: unusedClient}
+			deps.NewApplication = func(config agentwb.Config, options ...agentwb.Option) (Application, error) {
+				require.NotNil(t, config.Logger)
+				config.Logger = nil
+				require.Equal(t, wantConfig, config)
+				require.Len(t, options, 2)
+				return &fakeApplication{}, nil
+			}
+			root, err := NewRoot(deps)
 			require.NoError(t, err)
 			root.SetArgs(append([]string{"serve"}, test.args...))
-			err = root.ExecuteContext(context.Background())
-			var boundary *serveNotImplementedError
-			require.ErrorAs(t, err, &boundary)
-			require.Equal(t, test.want, boundary.settings)
+			require.NoError(t, root.ExecuteContext(context.Background()))
 		})
 	}
 }
@@ -269,13 +276,15 @@ func TestInvalidServerSettings(t *testing.T) {
 }
 
 func TestZeroServerLimitsRemainExplicit(t *testing.T) {
-	root, err := NewRoot(validDependencies())
+	deps := validDependencies()
+	deps.NewApplication = func(config agentwb.Config, _ ...agentwb.Option) (Application, error) {
+		require.Zero(t, config.MaxImageRequestBytes)
+		return &fakeApplication{}, nil
+	}
+	root, err := NewRoot(deps)
 	require.NoError(t, err)
 	root.SetArgs([]string{"serve", "--max-image-request-bytes", "0"})
-	err = root.ExecuteContext(context.Background())
-	var boundary *serveNotImplementedError
-	require.ErrorAs(t, err, &boundary)
-	require.Zero(t, boundary.settings.maxImageRequestBytes)
+	require.NoError(t, root.ExecuteContext(context.Background()))
 }
 
 func TestNewRootRejectsNilLikeDependencies(t *testing.T) {
@@ -311,8 +320,8 @@ func TestCommandRejectsTypedNilClient(t *testing.T) {
 	require.NoError(t, err)
 	root.SetArgs([]string{"image", "delete", "abc"})
 	require.NotPanics(t, func() { err = root.ExecuteContext(context.Background()) })
-	require.Error(t, err)
-	require.True(t, common.HasCode(err, common.CodeInvalidRequest), "error: %v", err)
+	require.EqualError(t, err, "client factory returned nil")
+	require.False(t, common.HasCode(err, common.CodeInvalidRequest), "error: %v", err)
 }
 
 func TestCommandTreeIsExact(t *testing.T) {

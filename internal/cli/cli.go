@@ -107,13 +107,14 @@ func NewRoot(deps Dependencies) (*cobra.Command, error) {
 		Short:         "Publish artifacts for trusted agents",
 		SilenceUsage:  true,
 		SilenceErrors: true,
-		Args:          cobra.NoArgs,
+		Args:          usageArgs(cobra.NoArgs),
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			return cmd.Help()
 		},
 	}
 	root.SetOut(deps.Stdout)
 	root.SetErr(deps.Stderr)
+	root.SetFlagErrorFunc(func(_ *cobra.Command, err error) error { return markUsage(err) })
 	root.CompletionOptions.DisableDefaultCmd = true
 	root.PersistentFlags().StringVar(&options.server, "server", "", "server origin")
 	root.PersistentFlags().StringVar(&options.timeout, "timeout", "", "client timeout")
@@ -139,7 +140,7 @@ func (factory commandFactory) newClient(cmd *cobra.Command) (Client, context.Con
 		return nil, nil, nil, stableCommandError(err)
 	}
 	if isNilLike(client) {
-		return nil, nil, nil, invalidCommand("client factory returned nil")
+		return nil, nil, nil, errors.New("client factory returned nil")
 	}
 	ctx, cancel := context.WithTimeout(cmd.Context(), settings.timeout)
 	return client, ctx, cancel, nil
@@ -186,33 +187,6 @@ func validateServerOrigin(value string) error {
 		return invalidCommand("server must be an absolute HTTP origin")
 	}
 	return nil
-}
-
-func (factory commandFactory) newServeCommand() *cobra.Command {
-	values := &serverFlagValues{}
-	command := &cobra.Command{
-		Use:  "serve",
-		Args: cobra.NoArgs,
-		RunE: func(cmd *cobra.Command, _ []string) error {
-			settings, err := factory.resolveServerSettings(cmd, values)
-			if err != nil {
-				return err
-			}
-			return &serveNotImplementedError{settings: settings}
-		},
-	}
-	flags := command.Flags()
-	flags.StringVar(&values.host, "host", "", "bind host")
-	flags.StringVar(&values.port, "port", "", "bind port")
-	flags.StringVar(&values.storage, "storage", "", "storage root")
-	flags.StringVar(&values.cleanupInterval, "cleanup-interval", "", "cleanup interval")
-	flags.StringVar(&values.defaultExpiration, "default-expires-in", "", "default expiration in seconds")
-	flags.StringVar(&values.shutdownTimeout, "shutdown-timeout", "", "shutdown timeout")
-	flags.StringVar(&values.logMode, "log-mode", "", "console or json logging")
-	flags.StringVar(&values.maxWhiteboardBytes, "max-whiteboard-bytes", "", "maximum whiteboard size")
-	flags.StringVar(&values.maxImageBytes, "max-image-bytes", "", "maximum image size")
-	flags.StringVar(&values.maxImageRequestBytes, "max-image-request-bytes", "", "maximum image request size")
-	return command
 }
 
 func (factory commandFactory) resolveServerSettings(cmd *cobra.Command, flags *serverFlagValues) (resolvedServerSettings, error) {
@@ -275,12 +249,6 @@ func effectiveLimit(value, defaultValue int64) int64 {
 	return value
 }
 
-type serveNotImplementedError struct {
-	settings resolvedServerSettings
-}
-
-func (err *serveNotImplementedError) Error() string { return "serve command is not implemented" }
-
 func defaultStoragePath() string {
 	home, err := os.UserHomeDir()
 	if err != nil || home == "" {
@@ -317,7 +285,29 @@ func parsePositiveDuration(value, field string) (time.Duration, error) {
 }
 
 func invalidCommand(message string) error {
-	return common.NewError(common.CodeInvalidRequest, message, nil)
+	return markUsage(common.NewError(common.CodeInvalidRequest, message, nil))
+}
+
+type usageError struct{ err error }
+
+func (err usageError) Error() string { return err.err.Error() }
+func (err usageError) Unwrap() error { return err.err }
+
+func markUsage(err error) error {
+	if err == nil {
+		return nil
+	}
+	var marked usageError
+	if errors.As(err, &marked) {
+		return err
+	}
+	return usageError{err: err}
+}
+
+func usageArgs(validation cobra.PositionalArgs) cobra.PositionalArgs {
+	return func(cmd *cobra.Command, args []string) error {
+		return markUsage(validation(cmd, args))
+	}
 }
 
 func isNilLike(value any) bool {
@@ -337,13 +327,49 @@ func stableCommandError(err error) error {
 	if err == nil {
 		return nil
 	}
-	if errors.Is(err, context.DeadlineExceeded) {
+	contextErr, contextOnly := contextOnlyError(err)
+	if !contextOnly {
+		return err
+	}
+	if contextErr == context.DeadlineExceeded {
 		return stableContextError{message: "request timed out", cause: context.DeadlineExceeded}
 	}
-	if errors.Is(err, context.Canceled) {
-		return stableContextError{message: "request canceled", cause: context.Canceled}
+	return stableContextError{message: "request canceled", cause: context.Canceled}
+}
+
+func contextOnlyError(err error) (error, bool) {
+	if err == nil {
+		return nil, false
 	}
-	return err
+	if err == context.DeadlineExceeded {
+		return context.DeadlineExceeded, true
+	}
+	if err == context.Canceled {
+		return context.Canceled, true
+	}
+	type multiUnwrapper interface{ Unwrap() []error }
+	if multi, ok := err.(multiUnwrapper); ok {
+		children := multi.Unwrap()
+		if len(children) == 0 {
+			return nil, false
+		}
+		kind := error(context.Canceled)
+		for _, child := range children {
+			childKind, childOnly := contextOnlyError(child)
+			if !childOnly {
+				return nil, false
+			}
+			if childKind == context.DeadlineExceeded {
+				kind = context.DeadlineExceeded
+			}
+		}
+		return kind, true
+	}
+	unwrapped := errors.Unwrap(err)
+	if unwrapped == nil {
+		return nil, false
+	}
+	return contextOnlyError(unwrapped)
 }
 
 type stableContextError struct {

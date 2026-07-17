@@ -9,13 +9,13 @@ import (
 )
 
 func (factory commandFactory) newImageCommand() *cobra.Command {
-	command := &cobra.Command{Use: "image", Args: cobra.NoArgs}
+	command := &cobra.Command{Use: "image", Args: usageArgs(cobra.NoArgs)}
 	command.AddCommand(factory.newImageUploadCommand(), factory.newImageUpdateCommand(), factory.newImageDeleteCommand())
 	return command
 }
 
 func (factory commandFactory) newImageUploadCommand() *cobra.Command {
-	command := &cobra.Command{Use: "upload <files...>", Args: cobra.MinimumNArgs(1)}
+	command := &cobra.Command{Use: "upload <files...>", Args: usageArgs(cobra.MinimumNArgs(1))}
 	expires := expirationFlag(command)
 	command.RunE = func(cmd *cobra.Command, args []string) error {
 		expiration, err := resolveExpiration(cmd, *expires)
@@ -57,7 +57,7 @@ func (factory commandFactory) newImageUploadCommand() *cobra.Command {
 }
 
 func (factory commandFactory) newImageUpdateCommand() *cobra.Command {
-	command := &cobra.Command{Use: "update <id> <file>", Args: cobra.ExactArgs(2)}
+	command := &cobra.Command{Use: "update <id> <file>", Args: usageArgs(cobra.ExactArgs(2))}
 	expires := expirationFlag(command)
 	command.RunE = func(cmd *cobra.Command, args []string) error {
 		expiration, err := resolveExpiration(cmd, *expires)
@@ -87,7 +87,7 @@ func (factory commandFactory) newImageUpdateCommand() *cobra.Command {
 func (factory commandFactory) newImageDeleteCommand() *cobra.Command {
 	return &cobra.Command{
 		Use:  "delete <id>",
-		Args: cobra.ExactArgs(1),
+		Args: usageArgs(cobra.ExactArgs(1)),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			client, ctx, cancel, err := factory.newClient(cmd)
 			if err != nil {
