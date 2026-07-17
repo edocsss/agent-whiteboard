@@ -100,8 +100,9 @@ func ReadMultipart(
 		return MultipartForm{}, invalidRequest("invalid multipart form", err)
 	}
 
-	r.Body = standardhttp.MaxBytesReader(w, r.Body, requestLimit)
-	reader := multipart.NewReader(r.Body, params["boundary"])
+	boundedBody := standardhttp.MaxBytesReader(w, r.Body, requestLimit)
+	r.Body = boundedBody
+	reader := multipart.NewReader(boundedBody, params["boundary"])
 	allowed := make(map[string]struct{}, len(allowedFileFields))
 	for _, field := range allowedFileFields {
 		if field == "" || field == "expires_in_seconds" {
@@ -117,6 +118,9 @@ func ReadMultipart(
 		if errors.Is(nextErr, io.EOF) {
 			if !sawPart {
 				return MultipartForm{}, invalidRequest("invalid multipart form", nil)
+			}
+			if _, drainErr := io.Copy(io.Discard, boundedBody); drainErr != nil {
+				return MultipartForm{}, multipartReadError(drainErr)
 			}
 			return form, nil
 		}
@@ -190,7 +194,7 @@ func publicError(err error) (int, ErrorBody) {
 	}
 
 	status, ok := errorStatuses[domainErr.Code]
-	if !ok {
+	if !ok || domainErr.Code == common.CodeInternal {
 		return standardhttp.StatusInternalServerError, ErrorBody{
 			Code:    common.CodeInternal,
 			Message: "internal error",

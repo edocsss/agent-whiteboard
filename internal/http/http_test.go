@@ -89,6 +89,30 @@ func TestWriteErrorHidesUnknownErrors(t *testing.T) {
 	require.NotContains(t, rr.Body.String(), "database password")
 }
 
+func TestWriteErrorHidesInternalDomainMessage(t *testing.T) {
+	rr := httptest.NewRecorder()
+
+	httpx.WriteError(rr, common.NewError(common.CodeInternal, "database password leaked", errors.New("secret path")))
+
+	require.Equal(t, http.StatusInternalServerError, rr.Code)
+	require.Equal(t, "application/json", rr.Header().Get("Content-Type"))
+	require.Equal(t, "{\"error\":{\"code\":\"internal_error\",\"message\":\"internal error\"}}\n", rr.Body.String())
+	require.NotContains(t, rr.Body.String(), "database password")
+	require.NotContains(t, rr.Body.String(), "secret path")
+}
+
+func TestWriteErrorHidesUnrecognizedDomainError(t *testing.T) {
+	rr := httptest.NewRecorder()
+
+	httpx.WriteError(rr, common.NewError(common.ErrorCode("future_error"), "private implementation detail", errors.New("secret cause")))
+
+	require.Equal(t, http.StatusInternalServerError, rr.Code)
+	require.Equal(t, "application/json", rr.Header().Get("Content-Type"))
+	require.Equal(t, "{\"error\":{\"code\":\"internal_error\",\"message\":\"internal error\"}}\n", rr.Body.String())
+	require.NotContains(t, rr.Body.String(), "private implementation detail")
+	require.NotContains(t, rr.Body.String(), "secret cause")
+}
+
 func TestSetPublicHeaders(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -137,6 +161,21 @@ func TestReadMultipartAcceptsAggregateAtLimit(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, form.Files, 1)
 	require.Equal(t, []byte("content"), form.Files[0].Content)
+}
+
+func TestReadMultipartRejectsChunkedOverflowAfterTerminalBoundary(t *testing.T) {
+	prefix, contentType := multipartBody(t, []multipartValue{
+		{fieldName: "file", filename: "board.md", content: "content"},
+	})
+	body := append(append([]byte(nil), prefix...), bytes.Repeat([]byte("epilogue"), 8)...)
+	req := httptest.NewRequest(http.MethodPost, "/", &chunkedReader{content: body, chunkSize: 1})
+	req.Header.Set("Content-Type", contentType)
+	require.Equal(t, int64(-1), req.ContentLength)
+
+	_, err := httpx.ReadMultipart(httptest.NewRecorder(), req, int64(len(prefix)), 1024, "file")
+
+	require.Error(t, err)
+	require.True(t, common.HasCode(err, common.CodeContentTooLarge), "expected content_too_large, got %v", err)
 }
 
 func TestReadPartRejectsPerPartOverflow(t *testing.T) {
@@ -199,6 +238,19 @@ func TestReadMultipartParsesSignedExpiration(t *testing.T) {
 	require.Equal(t, int64(-1), *form.ExpiresInSeconds)
 }
 
+func TestReadMultipartLeavesOmittedExpirationNil(t *testing.T) {
+	body, contentType := multipartBody(t, []multipartValue{
+		{fieldName: "file", filename: "board.md", content: "content"},
+	})
+	req := httptest.NewRequest(http.MethodPost, "/", bytes.NewReader(body))
+	req.Header.Set("Content-Type", contentType)
+
+	form, err := httpx.ReadMultipart(httptest.NewRecorder(), req, int64(len(body)), 1024, "file")
+
+	require.NoError(t, err)
+	require.Nil(t, form.ExpiresInSeconds)
+}
+
 func TestReadMultipartRejectsDuplicateExpiration(t *testing.T) {
 	body, contentType := multipartBody(t, []multipartValue{
 		{fieldName: "expires_in_seconds", content: "1"},
@@ -254,6 +306,21 @@ type multipartValue struct {
 	fieldName string
 	filename  string
 	content   string
+}
+
+type chunkedReader struct {
+	content   []byte
+	chunkSize int
+}
+
+func (r *chunkedReader) Read(destination []byte) (int, error) {
+	if len(r.content) == 0 {
+		return 0, io.EOF
+	}
+	read := min(len(destination), r.chunkSize, len(r.content))
+	copy(destination, r.content[:read])
+	r.content = r.content[read:]
+	return read, nil
 }
 
 func multipartBody(t *testing.T, values []multipartValue) ([]byte, string) {
