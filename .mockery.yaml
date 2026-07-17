@@ -2,6 +2,15 @@ template: testify
 formatter: goimports
 force-file-write: true
 packages:
+  github.com/edocsss/agent-whiteboard/internal/app:
+    config:
+      dir: "{{.InterfaceDir}}/mocks"
+      pkgname: mocks
+    interfaces:
+      Readiness:
+        config:
+          filename: mock_readiness.go
+          structname: MockReadiness
   github.com/edocsss/agent-whiteboard/internal/common:
     config:
       dir: "{{.InterfaceDir}}/mocks"
