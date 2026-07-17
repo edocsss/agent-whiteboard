@@ -166,6 +166,54 @@ func TestNewRejectsInvalidConfigurationAndTypedNilDependencies(t *testing.T) {
 	}
 }
 
+func TestNewPreflightsServerConfigurationBeforeTouchingStorage(t *testing.T) {
+	var typedNilListener *net.TCPListener
+	tests := []struct {
+		name    string
+		config  Config
+		options []Option
+	}{
+		{name: "host whitespace", config: Config{Host: "bad host"}},
+		{name: "host with port", config: Config{Host: "127.0.0.1:8567"}},
+		{name: "host with brackets", config: Config{Host: "[::1]"}},
+		{name: "host empty label", config: Config{Host: "bad..host"}},
+		{name: "typed nil listener", options: []Option{WithListener(typedNilListener)}},
+		{name: "listener nil address", options: []Option{WithListener(nilAddressListener{})}},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name+" absent root", func(t *testing.T) {
+			root := filepath.Join(t.TempDir(), "must-not-exist")
+			test.config.RootDir = root
+
+			service, err := New(test.config, test.options...)
+
+			require.Nil(t, service)
+			require.Error(t, err)
+			require.True(t, HasErrorCode(err, CodeInvalidRequest), "expected invalid_request, got %v", err)
+			_, statErr := os.Stat(root)
+			require.ErrorIs(t, statErr, os.ErrNotExist)
+		})
+
+		t.Run(test.name+" existing root", func(t *testing.T) {
+			root := filepath.Join(t.TempDir(), "existing")
+			require.NoError(t, os.Mkdir(root, 0o755))
+			test.config.RootDir = root
+
+			service, err := New(test.config, test.options...)
+
+			require.Nil(t, service)
+			require.Error(t, err)
+			require.True(t, HasErrorCode(err, CodeInvalidRequest), "expected invalid_request, got %v", err)
+			info, statErr := os.Stat(root)
+			require.NoError(t, statErr)
+			require.Equal(t, os.FileMode(0o755), info.Mode().Perm())
+			require.NoDirExists(t, filepath.Join(root, "whiteboards"))
+			require.NoDirExists(t, filepath.Join(root, "images"))
+		})
+	}
+}
+
 func TestServiceForwardsExactContextsAndValues(t *testing.T) {
 	now := time.Unix(10, 20).UTC()
 	whiteboards := &recordingWhiteboardStore{}
@@ -399,6 +447,12 @@ type sharedImageView struct {
 }
 
 func (view *sharedImageView) Close() error { return view.owner.Close() }
+
+type nilAddressListener struct{}
+
+func (nilAddressListener) Accept() (net.Conn, error) { return nil, errors.New("not used") }
+func (nilAddressListener) Close() error              { return nil }
+func (nilAddressListener) Addr() net.Addr            { return nil }
 
 func (ids *sequenceIDs) NewID() (string, error) {
 	ids.mu.Lock()
