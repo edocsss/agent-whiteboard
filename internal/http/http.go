@@ -82,11 +82,21 @@ func WriteJSON(w standardhttp.ResponseWriter, status int, value any) {
 }
 
 func RegisterHealth(mux *standardhttp.ServeMux, readiness Readiness) {
-	mux.HandleFunc("GET /healthz", func(w standardhttp.ResponseWriter, _ *standardhttp.Request) {
+	mux.HandleFunc("GET /healthz", func(w standardhttp.ResponseWriter, r *standardhttp.Request) {
+		if r.Method != standardhttp.MethodGet {
+			w.Header().Set("Allow", standardhttp.MethodGet)
+			w.WriteHeader(standardhttp.StatusMethodNotAllowed)
+			return
+		}
 		w.Header().Set("Cache-Control", "no-store")
 		WriteJSON(w, standardhttp.StatusOK, healthResponse{Status: "ok"})
 	})
 	mux.HandleFunc("GET /readyz", func(w standardhttp.ResponseWriter, r *standardhttp.Request) {
+		if r.Method != standardhttp.MethodGet {
+			w.Header().Set("Allow", standardhttp.MethodGet)
+			w.WriteHeader(standardhttp.StatusMethodNotAllowed)
+			return
+		}
 		w.Header().Set("Cache-Control", "no-store")
 		if isNilReadiness(readiness) || readiness.Ready(r.Context()) != nil {
 			WriteJSON(w, standardhttp.StatusServiceUnavailable, healthResponse{Status: "unavailable"})

@@ -117,6 +117,28 @@ func TestRegisterHealthUsesExactGetPatterns(t *testing.T) {
 	require.Equal(t, http.StatusNotFound, serveRequest(mux, httptest.NewRequest(http.MethodGet, "/readyz/child", nil)).Code)
 }
 
+func TestRegisterHealthRejectsHeadWithoutCheckingReadiness(t *testing.T) {
+	t.Parallel()
+
+	readinessCalls := 0
+	mux := http.NewServeMux()
+	httpx.RegisterHealth(mux, readinessFunc(func(context.Context) error {
+		readinessCalls++
+		return nil
+	}))
+
+	for _, path := range []string{"/healthz", "/readyz"} {
+		t.Run(path, func(t *testing.T) {
+			response := serveRequest(mux, httptest.NewRequest(http.MethodHead, path, nil))
+
+			require.Equal(t, http.StatusMethodNotAllowed, response.Code)
+			require.Empty(t, response.Body.String())
+			require.NotContains(t, response.Body.String(), "status")
+		})
+	}
+	require.Zero(t, readinessCalls)
+}
+
 func serveRequest(handler http.Handler, request *http.Request) *httptest.ResponseRecorder {
 	recorder := httptest.NewRecorder()
 	handler.ServeHTTP(recorder, request)
