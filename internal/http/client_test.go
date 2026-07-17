@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -20,6 +21,7 @@ import (
 )
 
 const clientTestID = "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3"
+const clientSecondTestID = "YWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4"
 
 func TestNewClientAcceptsOnlyHTTPOrigins(t *testing.T) {
 	t.Parallel()
@@ -38,7 +40,7 @@ func TestNewClientAcceptsOnlyHTTPOrigins(t *testing.T) {
 	invalid := []string{
 		"", "example.test", "/local", "ftp://example.test", "http://", "http:///missing-host",
 		"http://user@example.test", "http://example.test/api", "http://example.test//",
-		"http://example.test?debug=1", "http://example.test/#fragment",
+		"http://example.test?debug=1", "http://example.test/#fragment", "http://example.test#",
 	}
 	for _, server := range invalid {
 		server := server
@@ -69,6 +71,132 @@ func TestClientRejectsUnsupportedWhiteboardKindBeforeTransport(t *testing.T) {
 	}, nil)
 	require.Error(t, err)
 	require.False(t, transportCalled)
+}
+
+func TestClientRejectsTypedNilReadersBeforeTransport(t *testing.T) {
+	t.Parallel()
+
+	var transportCalls atomic.Int32
+	client := newTestClient(t, "http://example.test", &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		transportCalls.Add(1)
+		return nil, errors.New("unexpected transport call")
+	})})
+	var reader *nilSafeReader
+	file := httpx.File{Name: "typed-nil", Reader: reader}
+
+	tests := []struct {
+		name   string
+		invoke func() error
+	}{
+		{name: "create whiteboard", invoke: func() error {
+			_, err := client.CreateWhiteboard(context.Background(), httpx.WhiteboardMarkdown, file, nil)
+			return err
+		}},
+		{name: "update whiteboard", invoke: func() error {
+			_, err := client.UpdateWhiteboard(context.Background(), httpx.WhiteboardMarkdown, clientTestID, file, nil)
+			return err
+		}},
+		{name: "create images", invoke: func() error {
+			_, err := client.CreateImages(context.Background(), []httpx.File{file}, nil)
+			return err
+		}},
+		{name: "update image", invoke: func() error {
+			_, err := client.UpdateImage(context.Background(), clientTestID, file, nil)
+			return err
+		}},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var protocolErr *common.Error
+			require.ErrorAs(t, test.invoke(), &protocolErr)
+			require.Equal(t, common.CodeInvalidRequest, protocolErr.Code)
+		})
+	}
+	require.Zero(t, transportCalls.Load())
+}
+
+func TestClientContainsReaderPanicAsPrivateStableError(t *testing.T) {
+	t.Parallel()
+
+	transport := roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		_, err := io.Copy(io.Discard, request.Body)
+		return nil, err
+	})
+	client := newTestClient(t, "http://example.test", &http.Client{Transport: transport})
+
+	_, err := client.CreateWhiteboard(context.Background(), httpx.WhiteboardMarkdown, httpx.File{
+		Name: "panic.md", Reader: panicReader{},
+	}, nil)
+	var protocolErr *common.Error
+	require.ErrorAs(t, err, &protocolErr)
+	require.Equal(t, common.CodeInternal, protocolErr.Code)
+	require.Equal(t, "could not stream request body", protocolErr.Message)
+	require.NotContains(t, err.Error(), "secret panic payload")
+}
+
+func TestClientDoesNotFollowMutationRedirectsOrMutateCaller(t *testing.T) {
+	t.Parallel()
+
+	for _, operation := range []string{"multipart", "delete"} {
+		operation := operation
+		for _, destination := range []string{"same origin", "cross origin"} {
+			destination := destination
+			t.Run(operation+" "+destination, func(t *testing.T) {
+				t.Parallel()
+
+				var targetCalls atomic.Int32
+				target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+					targetCalls.Add(1)
+					w.WriteHeader(http.StatusNoContent)
+				}))
+				t.Cleanup(target.Close)
+
+				var source *httptest.Server
+				source = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					if r.URL.Path == "/redirect-target" {
+						targetCalls.Add(1)
+						w.WriteHeader(http.StatusNoContent)
+						return
+					}
+					location := target.URL + "/secret-target"
+					if destination == "same origin" {
+						location = source.URL + "/redirect-target?secret=private"
+					}
+					http.Redirect(w, r, location, http.StatusFound)
+				}))
+				t.Cleanup(source.Close)
+
+				callerHookErr := errors.New("caller redirect hook")
+				var callerHookCalls atomic.Int32
+				callerClient := source.Client()
+				callerClient.CheckRedirect = func(*http.Request, []*http.Request) error {
+					callerHookCalls.Add(1)
+					return callerHookErr
+				}
+				client := newTestClient(t, source.URL, callerClient)
+
+				var err error
+				if operation == "multipart" {
+					_, err = client.CreateWhiteboard(context.Background(), httpx.WhiteboardMarkdown, httpx.File{
+						Name: "board.md", Reader: strings.NewReader("body"),
+					}, nil)
+				} else {
+					err = client.DeleteImage(context.Background(), clientTestID)
+				}
+
+				var protocolErr *common.Error
+				require.ErrorAs(t, err, &protocolErr)
+				require.Equal(t, common.CodeInternal, protocolErr.Code)
+				require.Equal(t, "server returned an invalid error response", protocolErr.Message)
+				require.NotContains(t, err.Error(), "secret")
+				require.Zero(t, targetCalls.Load())
+				require.Zero(t, callerHookCalls.Load())
+				require.ErrorIs(t, callerClient.CheckRedirect(nil, nil), callerHookErr)
+				require.Equal(t, int32(1), callerHookCalls.Load())
+			})
+		}
+	}
 }
 
 func TestClientWhiteboardMutationsUseExactProtocol(t *testing.T) {
@@ -168,7 +296,10 @@ func TestClientImageMutationsPreserveOrderAndExpiration(t *testing.T) {
 		w.WriteHeader(expect.status)
 		resource := httpx.Resource{ID: clientTestID, Path: httpx.PublicImages + clientTestID}
 		if expect.many {
-			_ = json.NewEncoder(w).Encode(httpx.ImagesResponse{Images: []httpx.Resource{resource, {ID: "second"}}})
+			_ = json.NewEncoder(w).Encode(httpx.ImagesResponse{Images: []httpx.Resource{
+				resource,
+				{ID: clientSecondTestID, Path: httpx.PublicImages + clientSecondTestID},
+			}})
 			return
 		}
 		_ = json.NewEncoder(w).Encode(httpx.ResourceResponse{Resource: resource})
@@ -191,7 +322,7 @@ func TestClientImageMutationsPreserveOrderAndExpiration(t *testing.T) {
 		{Name: "second.jpg", Reader: strings.NewReader("second")},
 	}, &zero)
 	require.NoError(t, err)
-	require.Equal(t, []string{clientTestID, "second"}, []string{created[0].ID, created[1].ID})
+	require.Equal(t, []string{clientTestID, clientSecondTestID}, []string{created[0].ID, created[1].ID})
 
 	positive := int64(86400)
 	positiveText := "86400"
@@ -374,7 +505,7 @@ func TestClientRejectsMalformedAndOversizedResponses(t *testing.T) {
 func TestClientAcceptsResponseAtOneMiBLimit(t *testing.T) {
 	t.Parallel()
 
-	body := `{"resource":{"id":"` + clientTestID + `"}}`
+	body := `{"resource":{"id":"` + clientTestID + `","path":"/whiteboards/markdown/` + clientTestID + `"}}`
 	body += strings.Repeat(" ", (1<<20)-len(body))
 	require.Len(t, body, 1<<20)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -392,6 +523,74 @@ func TestClientAcceptsResponseAtOneMiBLimit(t *testing.T) {
 	require.Equal(t, clientTestID, resource.ID)
 }
 
+func TestClientRejectsInvalidSuccessEnvelopesPrivately(t *testing.T) {
+	t.Parallel()
+
+	validResource := `{"id":"` + clientTestID + `","path":"/images/` + clientTestID + `"}`
+	tests := []struct {
+		name      string
+		operation string
+		body      string
+	}{
+		{name: "null envelope", operation: "create", body: `null`},
+		{name: "missing envelope", operation: "create", body: `{}`},
+		{name: "missing resource fields", operation: "create", body: `{"resource":{}}`},
+		{name: "invalid resource id", operation: "create", body: `{"resource":{"id":"private-id","path":"/images/private-id"}}`},
+		{name: "missing resource path", operation: "create", body: `{"resource":{"id":"` + clientTestID + `"}}`},
+		{name: "relative resource path", operation: "create", body: `{"resource":{"id":"` + clientTestID + `","path":"images/private"}}`},
+		{name: "cross origin resource path", operation: "create", body: `{"resource":{"id":"` + clientTestID + `","path":"https://private.test/secret"}}`},
+		{name: "traversing resource path", operation: "create", body: `{"resource":{"id":"` + clientTestID + `","path":"/images/../private"}}`},
+		{name: "update id mismatch", operation: "update", body: `{"resource":{"id":"` + clientSecondTestID + `","path":"/images/` + clientSecondTestID + `"}}`},
+		{name: "nil images", operation: "images", body: `{"images":null}`},
+		{name: "wrong image cardinality", operation: "images", body: `{"images":[` + validResource + `]}`},
+		{name: "duplicate image ids", operation: "images", body: `{"images":[` + validResource + `,` + validResource + `]}`},
+		{name: "invalid image resource", operation: "images", body: `{"images":[` + validResource + `,{"id":"private","path":"/images/private"}]}`},
+	}
+
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				_, _ = io.Copy(io.Discard, r.Body)
+				if test.operation == "update" {
+					w.WriteHeader(http.StatusOK)
+				} else {
+					w.WriteHeader(http.StatusCreated)
+				}
+				_, _ = io.WriteString(w, test.body)
+			}))
+			t.Cleanup(server.Close)
+			client := newTestClient(t, server.URL, server.Client())
+
+			var err error
+			switch test.operation {
+			case "create":
+				_, err = client.CreateWhiteboard(context.Background(), httpx.WhiteboardMarkdown, httpx.File{
+					Name: "board.md", Reader: strings.NewReader("body"),
+				}, nil)
+			case "update":
+				_, err = client.UpdateImage(context.Background(), clientTestID, httpx.File{
+					Name: "image.png", Reader: strings.NewReader("body"),
+				}, nil)
+			case "images":
+				_, err = client.CreateImages(context.Background(), []httpx.File{
+					{Name: "one.png", Reader: strings.NewReader("one")},
+					{Name: "two.png", Reader: strings.NewReader("two")},
+				}, nil)
+			default:
+				t.Fatalf("unknown operation %q", test.operation)
+			}
+
+			var protocolErr *common.Error
+			require.ErrorAs(t, err, &protocolErr)
+			require.Equal(t, common.CodeInternal, protocolErr.Code)
+			require.Equal(t, "server returned an invalid response", protocolErr.Message)
+			require.NotContains(t, err.Error(), "private")
+		})
+	}
+}
+
 func TestClientPublicURLAcceptsOnlySafeSameOriginAbsolutePaths(t *testing.T) {
 	t.Parallel()
 
@@ -399,6 +598,7 @@ func TestClientPublicURLAcceptsOnlySafeSameOriginAbsolutePaths(t *testing.T) {
 	for path, want := range map[string]string{
 		"/whiteboards/markdown/" + clientTestID: "https://example.test:8443/whiteboards/markdown/" + clientTestID,
 		"/images/abc%20def":                     "https://example.test:8443/images/abc%20def",
+		"/images/hash%23value":                  "https://example.test:8443/images/hash%23value",
 	} {
 		got, err := client.PublicURL(path)
 		require.NoError(t, err)
@@ -408,7 +608,7 @@ func TestClientPublicURLAcceptsOnlySafeSameOriginAbsolutePaths(t *testing.T) {
 	invalid := []string{
 		"", "images/id", "//evil.test/images/id", "https://evil.test/images/id",
 		"/../admin", "/images/../admin", "/images/%2e%2e/admin", "/images/%2E%2E/admin",
-		"/images/id?secret=1", "/images/id#fragment", "/images/id\\..\\admin", "/images/id%5c..%5cadmin",
+		"/images/id?secret=1", "/images/id#fragment", "/images/id#", "/images/id\\..\\admin", "/images/id%5c..%5cadmin",
 	}
 	for _, path := range invalid {
 		got, err := client.PublicURL(path)
@@ -429,7 +629,7 @@ func TestClientStreamsMultipartWithoutReadingFileBeforeTransport(t *testing.T) {
 			StatusCode: http.StatusCreated,
 			Header:     make(http.Header),
 			Body: io.NopCloser(strings.NewReader(
-				`{"resource":{"id":"` + clientTestID + `"}}`,
+				`{"resource":{"id":"` + clientTestID + `","path":"/whiteboards/markdown/` + clientTestID + `"}}`,
 			)),
 			Request: request,
 		}, nil
@@ -575,6 +775,16 @@ type readCloser struct {
 }
 
 func (readCloser) Close() error { return nil }
+
+type nilSafeReader struct{}
+
+func (*nilSafeReader) Read([]byte) (int, error) { return 0, io.EOF }
+
+type panicReader struct{}
+
+func (panicReader) Read([]byte) (int, error) {
+	panic("secret panic payload")
+}
 
 func (zeroReader) Read(destination []byte) (int, error) {
 	for index := range destination {

@@ -9,6 +9,7 @@ import (
 	standardhttp "net/http"
 	"net/url"
 	"path"
+	"reflect"
 	"strconv"
 	"strings"
 
@@ -45,13 +46,17 @@ func NewClient(config ClientConfig) (*Client, error) {
 	}
 
 	baseURL, err := url.Parse(config.Server)
-	if err != nil || !validServerOrigin(baseURL) {
+	if err != nil || strings.Contains(config.Server, "#") || !validServerOrigin(baseURL) {
 		return nil, clientInvalidRequest("server must be an absolute HTTP origin")
 	}
 	baseURL.Path = ""
 	baseURL.RawPath = ""
+	httpClient := *config.HTTPClient
+	httpClient.CheckRedirect = func(*standardhttp.Request, []*standardhttp.Request) error {
+		return standardhttp.ErrUseLastResponse
+	}
 
-	return &Client{baseURL: baseURL, httpClient: config.HTTPClient}, nil
+	return &Client{baseURL: baseURL, httpClient: &httpClient}, nil
 }
 
 func (c *Client) CreateWhiteboard(
@@ -67,7 +72,13 @@ func (c *Client) CreateWhiteboard(
 
 	var response ResourceResponse
 	err = c.doMultipart(ctx, standardhttp.MethodPost, endpoint, "file", []File{file}, expiresInSeconds, standardhttp.StatusCreated, &response)
-	return response.Resource, err
+	if err != nil {
+		return Resource{}, err
+	}
+	if err := c.validateResource(response.Resource, ""); err != nil {
+		return Resource{}, err
+	}
+	return response.Resource, nil
 }
 
 func (c *Client) UpdateWhiteboard(
@@ -87,7 +98,13 @@ func (c *Client) UpdateWhiteboard(
 
 	var response ResourceResponse
 	err = c.doMultipart(ctx, standardhttp.MethodPut, endpoint+"/"+url.PathEscape(id), "file", []File{file}, expiresInSeconds, standardhttp.StatusOK, &response)
-	return response.Resource, err
+	if err != nil {
+		return Resource{}, err
+	}
+	if err := c.validateResource(response.Resource, id); err != nil {
+		return Resource{}, err
+	}
+	return response.Resource, nil
 }
 
 func (c *Client) DeleteWhiteboard(ctx context.Context, kind WhiteboardKind, id string) error {
@@ -108,7 +125,23 @@ func (c *Client) CreateImages(ctx context.Context, files []File, expiresInSecond
 
 	var response ImagesResponse
 	err := c.doMultipart(ctx, standardhttp.MethodPost, APIImages, "images", files, expiresInSeconds, standardhttp.StatusCreated, &response)
-	return response.Images, err
+	if err != nil {
+		return nil, err
+	}
+	if response.Images == nil || len(response.Images) != len(files) {
+		return nil, clientInvalidResponse("server returned an invalid response")
+	}
+	ids := make(map[string]struct{}, len(response.Images))
+	for _, resource := range response.Images {
+		if err := c.validateResource(resource, ""); err != nil {
+			return nil, err
+		}
+		if _, duplicate := ids[resource.ID]; duplicate {
+			return nil, clientInvalidResponse("server returned an invalid response")
+		}
+		ids[resource.ID] = struct{}{}
+	}
+	return response.Images, nil
 }
 
 func (c *Client) UpdateImage(
@@ -123,7 +156,13 @@ func (c *Client) UpdateImage(
 
 	var response ResourceResponse
 	err := c.doMultipart(ctx, standardhttp.MethodPut, APIImages+"/"+url.PathEscape(id), "file", []File{file}, expiresInSeconds, standardhttp.StatusOK, &response)
-	return response.Resource, err
+	if err != nil {
+		return Resource{}, err
+	}
+	if err := c.validateResource(response.Resource, id); err != nil {
+		return Resource{}, err
+	}
+	return response.Resource, nil
 }
 
 func (c *Client) DeleteImage(ctx context.Context, id string) error {
@@ -137,7 +176,7 @@ func (c *Client) PublicURL(publicPath string) (string, error) {
 	if c == nil || c.baseURL == nil {
 		return "", clientInvalidRequest("client is not configured")
 	}
-	if publicPath == "" || strings.Contains(publicPath, "\\") {
+	if publicPath == "" || strings.Contains(publicPath, "\\") || strings.Contains(publicPath, "#") {
 		return "", clientInvalidRequest("invalid public path")
 	}
 
@@ -164,6 +203,16 @@ func (c *Client) PublicURL(publicPath string) (string, error) {
 	return resolved.String(), nil
 }
 
+func (c *Client) validateResource(resource Resource, expectedID string) error {
+	if common.ValidateID(resource.ID) != nil || (expectedID != "" && resource.ID != expectedID) {
+		return clientInvalidResponse("server returned an invalid response")
+	}
+	if _, err := c.PublicURL(resource.Path); err != nil {
+		return clientInvalidResponse("server returned an invalid response")
+	}
+	return nil
+}
+
 func (c *Client) doMultipart(
 	ctx context.Context,
 	method string,
@@ -178,7 +227,7 @@ func (c *Client) doMultipart(
 		return clientInvalidRequest("multipart files are required")
 	}
 	for _, file := range files {
-		if file.Name == "" || file.Reader == nil {
+		if file.Name == "" || isNilReader(file.Reader) {
 			return clientInvalidRequest("file name and reader are required")
 		}
 	}
@@ -207,24 +256,33 @@ func writeMultipart(
 	expiresInSeconds *int64,
 ) {
 	var writeErr error
+	defer func() {
+		if recover() != nil {
+			writeErr = clientStreamError()
+		}
+		_ = pipe.CloseWithError(writeErr)
+	}()
 	for _, file := range files {
 		part, err := writer.CreateFormFile(fieldName, file.Name)
 		if err != nil {
-			writeErr = err
+			writeErr = clientStreamError()
 			break
 		}
 		if _, err := io.Copy(part, file.Reader); err != nil {
-			writeErr = err
+			writeErr = clientStreamError()
 			break
 		}
 	}
 	if writeErr == nil && expiresInSeconds != nil {
-		writeErr = writer.WriteField("expires_in_seconds", strconv.FormatInt(*expiresInSeconds, 10))
+		if err := writer.WriteField("expires_in_seconds", strconv.FormatInt(*expiresInSeconds, 10)); err != nil {
+			writeErr = clientStreamError()
+		}
 	}
 	if writeErr == nil {
-		writeErr = writer.Close()
+		if err := writer.Close(); err != nil {
+			writeErr = clientStreamError()
+		}
 	}
-	_ = pipe.CloseWithError(writeErr)
 }
 
 func (c *Client) do(
@@ -260,7 +318,12 @@ func (c *Client) newRequest(ctx context.Context, method string, endpoint string,
 func (c *Client) execute(request *standardhttp.Request, wantStatus int, result any) error {
 	response, err := c.httpClient.Do(request)
 	if err != nil {
-		return contextError(request.Context(), err)
+		err = contextError(request.Context(), err)
+		var protocolErr *common.Error
+		if errors.As(err, &protocolErr) {
+			return protocolErr
+		}
+		return err
 	}
 	defer response.Body.Close()
 
@@ -346,6 +409,19 @@ func validServerOrigin(server *url.URL) bool {
 	return server.RawPath == "" || server.RawPath == "/"
 }
 
+func isNilReader(reader io.Reader) bool {
+	if reader == nil {
+		return true
+	}
+	value := reflect.ValueOf(reader)
+	switch value.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice:
+		return value.IsNil()
+	default:
+		return false
+	}
+}
+
 func contextError(ctx context.Context, err error) error {
 	if err == nil {
 		return nil
@@ -370,4 +446,8 @@ func clientInvalidRequest(message string) error {
 
 func clientInvalidResponse(message string) error {
 	return common.NewError(common.CodeInternal, message, nil)
+}
+
+func clientStreamError() error {
+	return clientInvalidResponse("could not stream request body")
 }
