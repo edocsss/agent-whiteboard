@@ -23,7 +23,9 @@ test("sanitizes hostile Markdown and preserves ordinary code", async ({ page, pu
   expect(response).not.toBeNull();
 
   const content = page.locator("#agent-whiteboard-content");
-  await expect(content.locator("script, style, img, svg")).toHaveCount(0);
+  await expect(content.locator("script, style, img")).toHaveCount(0);
+  await expect(content.locator("svg:not(.theme-control-icon)")).toHaveCount(0);
+  await expect(content.locator(".theme-control .theme-control-icon")).toHaveCount(4);
   await expect(content.locator('a[href^="javascript:"]')).toHaveCount(0);
   expect(
     await content.locator("*").evaluateAll((nodes) =>

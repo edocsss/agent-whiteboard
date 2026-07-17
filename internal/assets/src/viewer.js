@@ -180,6 +180,58 @@ function themeLabel(theme) {
   return `${theme.slice(0, 1).toUpperCase()}${theme.slice(1)}`;
 }
 
+function createSVGElement(doc, name, attributes = {}) {
+  const element = doc.createElementNS("http://www.w3.org/2000/svg", name);
+  for (const [attribute, value] of Object.entries(attributes)) element.setAttribute(attribute, value);
+  return element;
+}
+
+function themeIcon(doc, theme) {
+  const svg = createSVGElement(doc, "svg", {
+    viewBox: "0 0 24 24",
+    fill: "none",
+    stroke: "currentColor",
+    "stroke-width": "1.8",
+    "stroke-linecap": "round",
+    "stroke-linejoin": "round",
+    "aria-hidden": "true",
+  });
+  svg.classList.add("theme-control-icon");
+  svg.dataset.themeIcon = theme;
+
+  if (theme === "light") {
+    svg.append(createSVGElement(doc, "circle", { cx: "12", cy: "12", r: "3.5" }));
+    for (const [x1, y1, x2, y2] of [
+      [12, 2, 12, 4],
+      [12, 20, 12, 22],
+      [2, 12, 4, 12],
+      [20, 12, 22, 12],
+      [4.9, 4.9, 6.3, 6.3],
+      [17.7, 17.7, 19.1, 19.1],
+      [17.7, 6.3, 19.1, 4.9],
+      [4.9, 19.1, 6.3, 17.7],
+    ]) {
+      svg.append(createSVGElement(doc, "line", { x1, y1, x2, y2 }));
+    }
+    return svg;
+  }
+
+  if (theme === "dark") {
+    svg.append(
+      createSVGElement(doc, "path", {
+        d: "M20.2 15.2A8.5 8.5 0 0 1 8.8 3.8 8.5 8.5 0 1 0 20.2 15.2Z",
+      }),
+    );
+    return svg;
+  }
+
+  svg.append(
+    createSVGElement(doc, "circle", { cx: "12", cy: "12", r: "8.5" }),
+    createSVGElement(doc, "path", { d: "M12 3.5a8.5 8.5 0 0 1 0 17Z", fill: "currentColor", stroke: "none" }),
+  );
+  return svg;
+}
+
 function createThemeControl({ doc, container, controller }) {
   const root = doc.createElement("div");
   root.className = "theme-control";
@@ -201,6 +253,11 @@ function createThemeControl({ doc, container, controller }) {
   menu.setAttribute("role", "menu");
   menu.setAttribute("aria-label", "Theme selection");
 
+  const descriptions = {
+    system: "Match your device",
+    light: "Bright appearance",
+    dark: "Low-light appearance",
+  };
   const options = ["system", "light", "dark"].map((value) => {
     const option = doc.createElement("button");
     option.type = "button";
@@ -209,7 +266,19 @@ function createThemeControl({ doc, container, controller }) {
     option.dataset.themeOption = value;
     option.setAttribute("role", "menuitemradio");
     option.setAttribute("aria-checked", "false");
-    option.textContent = themeLabel(value);
+    const copy = doc.createElement("span");
+    copy.className = "theme-control-option-copy";
+    const title = doc.createElement("span");
+    title.className = "theme-control-option-title";
+    title.textContent = themeLabel(value);
+    const description = doc.createElement("span");
+    description.className = "theme-control-option-description";
+    description.textContent = descriptions[value];
+    const indicator = doc.createElement("span");
+    indicator.className = "theme-control-option-indicator";
+    indicator.setAttribute("aria-hidden", "true");
+    copy.append(title, description);
+    option.append(themeIcon(doc, value), copy, indicator);
     menu.append(option);
     return option;
   });
@@ -219,10 +288,15 @@ function createThemeControl({ doc, container, controller }) {
 
   function sync() {
     const selected = controller.theme;
-    trigger.textContent = `Theme: ${themeLabel(selected)}`;
+    const label = `Appearance: ${themeLabel(selected)}`;
+    trigger.replaceChildren(themeIcon(doc, selected));
+    trigger.setAttribute("aria-label", label);
+    trigger.title = label;
     trigger.setAttribute("aria-expanded", String(!menu.hidden));
     for (const option of options) {
-      option.setAttribute("aria-checked", String(option.dataset.theme === selected));
+      const isSelected = option.dataset.theme === selected;
+      option.setAttribute("aria-checked", String(isSelected));
+      option.querySelector(".theme-control-option-indicator").textContent = isSelected ? "✓" : "";
     }
   }
 

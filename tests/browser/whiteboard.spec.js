@@ -61,13 +61,14 @@ test("renders the complete Markdown contract without external requests", async (
   await expect(page.locator('a[href^="javascript:"]')).toHaveCount(0);
 
   const themeControl = page.locator("[data-theme-control]");
-  await expect(themeControl).toHaveText("Theme: System");
+  await expect(themeControl).toHaveAttribute("aria-label", "Appearance: System");
   await themeControl.click();
   await page.locator('[data-theme-option="dark"]').click();
   await expect(page.locator("html")).toHaveAttribute("data-theme", "dark");
-  await expect(themeControl).toHaveText("Theme: Dark");
+  await expect(themeControl).toHaveAttribute("aria-label", "Appearance: Dark");
+  await expect(themeControl.locator('[data-theme-icon="dark"]')).toHaveCount(1);
   await page.reload();
-  await expect(themeControl).toHaveText("Theme: Dark");
+  await expect(themeControl).toHaveAttribute("aria-label", "Appearance: Dark");
   await themeControl.click();
   await page.locator('[data-theme-option="system"]').click();
   await expect.poll(() => page.evaluate(() => localStorage.getItem("agent-whiteboard-theme"))).toBe("system");

@@ -142,13 +142,14 @@ describe("Markdown rendering", () => {
 
     const trigger = container.querySelector("[data-theme-control]");
     const menu = container.querySelector("[data-theme-menu]");
-    expect(trigger?.textContent).toBe("Theme: System");
+    expect(trigger?.getAttribute("aria-label")).toBe("Appearance: System");
+    expect(trigger?.querySelector('[data-theme-icon="system"]')).not.toBeNull();
     expect(menu?.hidden).toBe(true);
-    expect([...container.querySelectorAll("[data-theme-option]")].map((option) => option.textContent)).toEqual([
-      "System",
-      "Light",
-      "Dark",
-    ]);
+    expect(
+      [...container.querySelectorAll("[data-theme-option]")].map(
+        (option) => option.querySelector(".theme-control-option-title")?.textContent,
+      ),
+    ).toEqual(["System", "Light", "Dark"]);
 
     trigger.click();
     expect(trigger.getAttribute("aria-expanded")).toBe("true");
@@ -157,7 +158,8 @@ describe("Markdown rendering", () => {
 
     expect(localStorage.getItem(THEME_STORAGE_KEY)).toBe("light");
     expect(document.documentElement.dataset.theme).toBe("light");
-    expect(trigger.textContent).toBe("Theme: Light");
+    expect(trigger.getAttribute("aria-label")).toBe("Appearance: Light");
+    expect(trigger.querySelector('[data-theme-icon="light"]')).not.toBeNull();
     expect(menu.hidden).toBe(true);
   });
 });
@@ -214,7 +216,8 @@ describe("themes", () => {
     const trigger = container.querySelector("[data-theme-control]");
     const menu = container.querySelector("[data-theme-menu]");
 
-    expect(trigger.textContent).toBe("Theme: Dark");
+    expect(trigger.getAttribute("aria-label")).toBe("Appearance: Dark");
+    expect(trigger.querySelector('[data-theme-icon="dark"]')).not.toBeNull();
     trigger.click();
     document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
     expect(menu.hidden).toBe(true);
