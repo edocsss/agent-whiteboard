@@ -6,6 +6,8 @@ import mermaid from "mermaid";
 export const DEFAULT_TITLE = "Untitled whiteboard";
 export const THEME_STORAGE_KEY = "agent-whiteboard-theme";
 
+const THEME_CONTROL_CLEANUP = Symbol("theme-control-cleanup");
+
 const ALLOWED_THEMES = new Set(["light", "dark", "system"]);
 const MERMAID_SECURE_KEYS = [
   "secure",
@@ -174,6 +176,96 @@ function persistTheme(storage, theme) {
   }
 }
 
+function themeLabel(theme) {
+  return `${theme.slice(0, 1).toUpperCase()}${theme.slice(1)}`;
+}
+
+function createThemeControl({ doc, container, controller }) {
+  const root = doc.createElement("div");
+  root.className = "theme-control";
+
+  const menuID = "agent-whiteboard-theme-menu";
+  const trigger = doc.createElement("button");
+  trigger.type = "button";
+  trigger.className = "theme-control-trigger";
+  trigger.dataset.themeControl = "";
+  trigger.setAttribute("aria-controls", menuID);
+  trigger.setAttribute("aria-expanded", "false");
+  trigger.setAttribute("aria-haspopup", "menu");
+
+  const menu = doc.createElement("div");
+  menu.id = menuID;
+  menu.className = "theme-control-menu";
+  menu.dataset.themeMenu = "";
+  menu.hidden = true;
+  menu.setAttribute("role", "menu");
+  menu.setAttribute("aria-label", "Theme selection");
+
+  const options = ["system", "light", "dark"].map((value) => {
+    const option = doc.createElement("button");
+    option.type = "button";
+    option.className = "theme-control-option";
+    option.dataset.theme = value;
+    option.dataset.themeOption = value;
+    option.setAttribute("role", "menuitemradio");
+    option.setAttribute("aria-checked", "false");
+    option.textContent = themeLabel(value);
+    menu.append(option);
+    return option;
+  });
+
+  root.append(trigger, menu);
+  container.prepend(root);
+
+  function sync() {
+    const selected = controller.theme;
+    trigger.textContent = `Theme: ${themeLabel(selected)}`;
+    trigger.setAttribute("aria-expanded", String(!menu.hidden));
+    for (const option of options) {
+      option.setAttribute("aria-checked", String(option.dataset.theme === selected));
+    }
+  }
+
+  function close({ restoreFocus = false } = {}) {
+    menu.hidden = true;
+    sync();
+    if (restoreFocus) trigger.focus();
+  }
+
+  const onTriggerClick = () => {
+    menu.hidden = !menu.hidden;
+    sync();
+  };
+  const onOptionClick = async (event) => {
+    const pendingThemeChange = controller.setTheme(event.currentTarget.dataset.theme);
+    sync();
+    close({ restoreFocus: true });
+    await pendingThemeChange;
+  };
+  const onDocumentPointerDown = (event) => {
+    if (!root.contains(event.target)) close();
+  };
+  const onDocumentKeyDown = (event) => {
+    if (event.key === "Escape" && !menu.hidden) close({ restoreFocus: true });
+  };
+
+  trigger.addEventListener("click", onTriggerClick);
+  for (const option of options) option.addEventListener("click", onOptionClick);
+  doc.addEventListener("pointerdown", onDocumentPointerDown);
+  doc.addEventListener("keydown", onDocumentKeyDown);
+  sync();
+
+  return {
+    destroy() {
+      trigger.removeEventListener("click", onTriggerClick);
+      for (const option of options) option.removeEventListener("click", onOptionClick);
+      doc.removeEventListener("pointerdown", onDocumentPointerDown);
+      doc.removeEventListener("keydown", onDocumentKeyDown);
+      root.remove();
+    },
+  };
+}
+
 export async function renderWhiteboard(
   source,
   {
@@ -186,6 +278,8 @@ export async function renderWhiteboard(
   if (typeof source !== "string") throw new TypeError("whiteboard source must be a string");
   if (!container) throw new TypeError("viewer container is required");
 
+  container[THEME_CONTROL_CLEANUP]?.();
+  container[THEME_CONTROL_CLEANUP] = undefined;
   const { diagramSources, html } = renderMarkdown(source, doc);
   container.innerHTML = html;
   highlightCode(container);
@@ -244,10 +338,15 @@ export async function renderWhiteboard(
       return pendingRender;
     },
     destroy() {
+      themeControl.destroy();
+      container[THEME_CONTROL_CLEANUP] = undefined;
       if (subscribed) mediaQuery.removeEventListener?.("change", onSystemThemeChange);
       subscribed = false;
     },
   };
+
+  const themeControl = createThemeControl({ doc, container, controller });
+  container[THEME_CONTROL_CLEANUP] = themeControl.destroy;
 
   persistTheme(storage, theme);
   syncSystemSubscription();

@@ -134,6 +134,32 @@ describe("Markdown rendering", () => {
 
     expect(document.title).toBe(DEFAULT_TITLE);
   });
+
+  test("provides a theme menu that applies and persists Light", async () => {
+    const container = document.querySelector("#viewer");
+
+    const viewer = await renderWhiteboard("# Board", { container });
+
+    const trigger = container.querySelector("[data-theme-control]");
+    const menu = container.querySelector("[data-theme-menu]");
+    expect(trigger?.textContent).toBe("Theme: System");
+    expect(menu?.hidden).toBe(true);
+    expect([...container.querySelectorAll("[data-theme-option]")].map((option) => option.textContent)).toEqual([
+      "System",
+      "Light",
+      "Dark",
+    ]);
+
+    trigger.click();
+    expect(trigger.getAttribute("aria-expanded")).toBe("true");
+    container.querySelector('[data-theme-option="light"]').click();
+    await viewer.settled();
+
+    expect(localStorage.getItem(THEME_STORAGE_KEY)).toBe("light");
+    expect(document.documentElement.dataset.theme).toBe("light");
+    expect(trigger.textContent).toBe("Theme: Light");
+    expect(menu.hidden).toBe(true);
+  });
 });
 
 describe("themes", () => {
@@ -178,6 +204,28 @@ describe("themes", () => {
     expect(document.documentElement.dataset.theme).toBe("light");
     expect(mermaidMocks.render).toHaveBeenCalledTimes(3);
     expect(Object.keys(localStorage)).toEqual([THEME_STORAGE_KEY]);
+  });
+
+  test("restores stored theme and closes the menu with Escape or outside click", async () => {
+    const container = document.querySelector("#viewer");
+    localStorage.setItem(THEME_STORAGE_KEY, "dark");
+
+    const viewer = await renderWhiteboard("# Board", { container });
+    const trigger = container.querySelector("[data-theme-control]");
+    const menu = container.querySelector("[data-theme-menu]");
+
+    expect(trigger.textContent).toBe("Theme: Dark");
+    trigger.click();
+    document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+    expect(menu.hidden).toBe(true);
+    expect(document.activeElement).toBe(trigger);
+
+    trigger.click();
+    document.dispatchEvent(new Event("pointerdown", { bubbles: true }));
+    expect(menu.hidden).toBe(true);
+
+    viewer.destroy();
+    expect(container.querySelector("[data-theme-control]")).toBeNull();
   });
 });
 
