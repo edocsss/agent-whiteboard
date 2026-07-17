@@ -72,6 +72,17 @@ func TestEmbeddedAssetsHaveNoExternalRuntimeReferences(t *testing.T) {
 	}
 }
 
+func TestEmbeddedAssetsCannotTerminateViewerInlineElements(t *testing.T) {
+	t.Parallel()
+
+	if bytes.Contains(bytes.ToLower(ViewerJS()), []byte("</script")) {
+		t.Fatal("viewer JavaScript contains a closing script marker")
+	}
+	if bytes.Contains(bytes.ToLower(ViewerCSS()), []byte("</style")) {
+		t.Fatal("viewer CSS contains a closing style marker")
+	}
+}
+
 func TestEmbeddedAssetAccessorsReturnFreshCopies(t *testing.T) {
 	t.Parallel()
 

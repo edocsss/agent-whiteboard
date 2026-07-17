@@ -390,7 +390,9 @@ func TestHandlerRejectsInvalidFormsBeforeServiceCalls(t *testing.T) {
 	}
 }
 
-func TestHandlerRejectsMalformedIDsBeforeReadingFormsOrCallingService(t *testing.T) {
+func TestHandlerHidesMalformedCapabilityIDsBeforeReadingFormsOrCallingService(t *testing.T) {
+	wantBody := "{\"error\":{\"code\":\"not_found\",\"message\":\"resource not found\"}}\n"
+
 	for _, route := range whiteboardRoutes {
 		t.Run(route.name, func(t *testing.T) {
 			for _, method := range []string{http.MethodPut, http.MethodDelete} {
@@ -402,9 +404,11 @@ func TestHandlerRejectsMalformedIDsBeforeReadingFormsOrCallingService(t *testing
 
 					handlerMux(t, handler).ServeHTTP(rr, req)
 
-					require.Equal(t, http.StatusBadRequest, rr.Code)
-					require.Equal(t, common.CodeInvalidRequest, decodeError(t, rr).Code)
-					require.Equal(t, "invalid resource id", decodeErrorBody(t, rr).Error.Message)
+					require.Equal(t, http.StatusNotFound, rr.Code)
+					require.Equal(t, "application/json", rr.Header().Get("Content-Type"))
+					require.Equal(t, wantBody, rr.Body.String())
+					require.NotContains(t, rr.Body.String(), "malformed")
+					require.NotContains(t, rr.Body.String(), "invalid resource id")
 				})
 			}
 		})

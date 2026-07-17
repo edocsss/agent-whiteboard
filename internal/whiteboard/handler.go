@@ -134,7 +134,7 @@ func (h *Handler) updateHTML(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) update(w http.ResponseWriter, r *http.Request, kind Kind) {
 	id := r.PathValue("id")
 	if err := common.ValidateID(id); err != nil {
-		httpx.WriteError(w, err)
+		httpx.WriteError(w, notFound())
 		return
 	}
 
@@ -170,7 +170,7 @@ func (h *Handler) deleteHTML(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) delete(w http.ResponseWriter, r *http.Request, kind Kind) {
 	id := r.PathValue("id")
 	if err := common.ValidateID(id); err != nil {
-		httpx.WriteError(w, err)
+		httpx.WriteError(w, notFound())
 		return
 	}
 	if err := h.operations.Delete(r.Context(), kind, id); err != nil {
