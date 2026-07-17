@@ -88,7 +88,94 @@ func TestServerLogsBoundAddressBeforeReadinessAndServesRealRequests(t *testing.T
 	require.Equal(t, int32(1), closer.calls.Load())
 }
 
-func TestServerCancellationMarksNotReadyBeforeShutdownAndLetsInflightRequestFinish(t *testing.T) {
+func TestServerCancellationWhileStartupLogBlockedShutsDownWithoutWaitingForLogger(t *testing.T) {
+	application := newLifecycleApp(http.NotFoundHandler())
+	listener := listenLocal(t)
+	loggerHandler := newListeningLogBarrier()
+	closer := &countingCloser{}
+	server := newTestServer(t, application, slog.New(loggerHandler), listener, time.Second, closer)
+	ctx, cancel := context.WithCancel(context.Background())
+	serveDone := serveInBackground(server, ctx, listener)
+	serveReturned := false
+	t.Cleanup(func() {
+		cancel()
+		releaseListeningLog(loggerHandler)
+		if !serveReturned {
+			receive(t, serveDone)
+		}
+	})
+	receive(t, loggerHandler.entered)
+
+	cancel()
+	select {
+	case err := <-serveDone:
+		serveReturned = true
+		require.NoError(t, err)
+	case <-time.After(serverTestTimeout):
+		t.Fatal("serve cancellation waited for the blocked startup logger")
+	}
+
+	require.False(t, application.readiness.accepting.Load(), "server became ready after its lifetime context was canceled")
+	require.Equal(t, int32(1), closer.calls.Load())
+	requireListenerUnavailable(t, listener.Addr().String())
+}
+
+func TestServerFailureWhileStartupLogBlockedReturnsWithoutMarkingReady(t *testing.T) {
+	serveFailure := errors.New("accept failed")
+	failAccept := make(chan struct{})
+	failureObserved := make(chan struct{})
+	listener := &failingAcceptListener{
+		Listener: listenLocal(t),
+		fail:     failAccept,
+		failed:   failureObserved,
+		err:      serveFailure,
+	}
+	application := newLifecycleApp(http.NotFoundHandler())
+	loggerHandler := newListeningLogBarrier()
+	closer := &countingCloser{}
+	server := newTestServer(t, application, slog.New(loggerHandler), listener, time.Second, closer)
+	serveDone := serveInBackground(server, context.Background(), listener)
+	serveReturned := false
+	t.Cleanup(func() {
+		releaseListeningLog(loggerHandler)
+		if !serveReturned {
+			receive(t, serveDone)
+		}
+	})
+	receive(t, loggerHandler.entered)
+
+	close(failAccept)
+	receive(t, failureObserved)
+	require.False(t, application.readiness.accepting.Load(), "server became ready while Serve had already failed")
+	select {
+	case err := <-serveDone:
+		serveReturned = true
+		require.ErrorIs(t, err, serveFailure)
+	case <-time.After(serverTestTimeout):
+		t.Fatal("Serve failure waited for the blocked startup logger")
+	}
+
+	require.False(t, application.readiness.accepting.Load(), "server became ready after Serve failed")
+	require.Equal(t, int32(1), closer.calls.Load())
+	requireListenerUnavailable(t, listener.Addr().String())
+}
+
+func TestServerContainsStartupLoggingPanicAndTerminatesLifecycle(t *testing.T) {
+	application := newLifecycleApp(http.NotFoundHandler())
+	listener := listenLocal(t)
+	closer := &countingCloser{}
+	server := newTestServer(t, application, slog.New(panickingLogHandler{}), listener, time.Second, closer)
+
+	err := receive(t, serveInBackground(server, context.Background(), listener))
+
+	require.ErrorContains(t, err, "server listening log handler panicked")
+	require.NotContains(t, err.Error(), "private panic detail")
+	require.False(t, application.readiness.accepting.Load())
+	require.Equal(t, int32(1), closer.calls.Load())
+	requireListenerUnavailable(t, listener.Addr().String())
+}
+
+func TestServerCancellationUsesFreshShutdownContextAndLetsInflightRequestFinish(t *testing.T) {
 	requestEntered := make(chan struct{})
 	shutdownStarted := make(chan struct{})
 	readinessFalseAtShutdown := make(chan bool, 1)
@@ -114,7 +201,13 @@ func TestServerCancellationMarksNotReadyBeforeShutdownAndLetsInflightRequestFini
 			close(shutdownStarted)
 		},
 	}
-	server := newTestServer(t, application, discardLogger(), listener, time.Second)
+	closer := &countingCloser{}
+	server := newTestServer(t, application, discardLogger(), listener, time.Second, closer)
+	shutdownContexts := make(chan shutdownContextRequest, 1)
+	server.newShutdownContext = func(parent context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
+		shutdownContexts <- shutdownContextRequest{parent: parent, timeout: timeout}
+		return context.WithTimeout(parent, timeout)
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	serveDone := serveInBackground(server, ctx, listener)
 	waitForReady(t, application)
@@ -122,6 +215,11 @@ func TestServerCancellationMarksNotReadyBeforeShutdownAndLetsInflightRequestFini
 	receive(t, requestEntered)
 
 	cancel()
+	shutdownContext := receive(t, shutdownContexts)
+	require.ErrorIs(t, ctx.Err(), context.Canceled)
+	require.True(t, shutdownContext.parent == context.Background(), "shutdown context was not rooted at context.Background")
+	require.NoError(t, shutdownContext.parent.Err(), "fresh shutdown parent was already canceled")
+	require.Equal(t, time.Second, shutdownContext.timeout)
 	require.True(t, receive(t, readinessFalseAtShutdown), "listener closed before readiness became false")
 	require.True(t, receive(t, requestContextLive), "request context was canceled instead of using a fresh graceful-shutdown context")
 	close(releaseRequest)
@@ -130,6 +228,7 @@ func TestServerCancellationMarksNotReadyBeforeShutdownAndLetsInflightRequestFini
 	require.NoError(t, responseResult.err)
 	require.Equal(t, "finished", responseResult.body)
 	require.NoError(t, receive(t, serveDone))
+	require.Equal(t, int32(1), closer.calls.Load())
 }
 
 func TestServerForceClosesHandlerAfterShutdownDeadline(t *testing.T) {
@@ -214,6 +313,78 @@ func TestServerCloseIsIdempotentAndReturnsSameJoinedError(t *testing.T) {
 	require.True(t, firstResult == secondResult, "Close returned a newly-created error on repetition")
 	require.Equal(t, int32(1), first.calls.Load())
 	require.Equal(t, int32(1), second.calls.Load())
+}
+
+func TestServerConcurrentCloseCallsPublishSameJoinedError(t *testing.T) {
+	closeFailure := errors.New("close failed")
+	closer := &blockingCloser{
+		entered: make(chan struct{}),
+		release: make(chan struct{}),
+		err:     closeFailure,
+	}
+	server := newTestServer(t, newLifecycleApp(http.NotFoundHandler()), discardLogger(), nil, time.Second, closer)
+	const callers = 16
+	start := make(chan struct{})
+	results := make(chan error, callers)
+	for range callers {
+		go func() {
+			<-start
+			results <- server.Close()
+		}()
+	}
+
+	close(start)
+	receive(t, closer.entered)
+	close(closer.release)
+	firstResult := receive(t, results)
+	require.ErrorIs(t, firstResult, closeFailure)
+	for range callers - 1 {
+		result := receive(t, results)
+		require.True(t, result == firstResult, "concurrent Close returned a different stored error")
+	}
+	require.Equal(t, int32(1), closer.calls.Load())
+}
+
+func TestServerDirectShutdownRacingCancellationDoesNotDeadlockOrDoubleClose(t *testing.T) {
+	requestEntered := make(chan struct{})
+	releaseRequest := make(chan struct{})
+	application := newLifecycleApp(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
+		close(requestEntered)
+		<-releaseRequest
+		response.WriteHeader(http.StatusNoContent)
+	}))
+	listenerCloseEntered := make(chan struct{})
+	releaseListenerClose := make(chan struct{})
+	listener := &closeObservingListener{
+		Listener: listenLocal(t),
+		onClose: func() {
+			close(listenerCloseEntered)
+			<-releaseListenerClose
+		},
+	}
+	closer := &countingCloser{}
+	server := newTestServer(t, application, discardLogger(), listener, time.Second, closer)
+	serveCtx, cancelServe := context.WithCancel(context.Background())
+	serveDone := serveInBackground(server, serveCtx, listener)
+	waitForReady(t, application)
+	responseDone := getInBackground("http://" + listener.Addr().String())
+	receive(t, requestEntered)
+
+	shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), serverTestTimeout)
+	defer cancelShutdown()
+	shutdownDone := make(chan error, 1)
+	go func() { shutdownDone <- server.Shutdown(shutdownCtx) }()
+	receive(t, listenerCloseEntered)
+	cancelServe()
+	close(releaseListenerClose)
+	close(releaseRequest)
+
+	require.NoError(t, receive(t, shutdownDone))
+	require.NoError(t, receive(t, serveDone))
+	responseResult := receive(t, responseDone)
+	require.NoError(t, responseResult.err)
+	require.False(t, application.readiness.accepting.Load())
+	require.Equal(t, int32(1), closer.calls.Load())
 }
 
 func TestServerRejectsSimultaneousAndReusedServeCallsWithoutConsumingRejectedListeners(t *testing.T) {
@@ -334,6 +505,47 @@ type countingCloser struct {
 	err   error
 }
 
+type blockingCloser struct {
+	calls   atomic.Int32
+	entered chan struct{}
+	release chan struct{}
+	err     error
+	once    sync.Once
+}
+
+func (closer *blockingCloser) Close() error {
+	closer.calls.Add(1)
+	closer.once.Do(func() { close(closer.entered) })
+	<-closer.release
+	return closer.err
+}
+
+type failingAcceptListener struct {
+	net.Listener
+	fail   <-chan struct{}
+	failed chan<- struct{}
+	err    error
+	once   sync.Once
+}
+
+func (listener *failingAcceptListener) Accept() (net.Conn, error) {
+	<-listener.fail
+	listener.once.Do(func() { close(listener.failed) })
+	return nil, listener.err
+}
+
+type panickingLogHandler struct{}
+
+func (panickingLogHandler) Enabled(context.Context, slog.Level) bool { return true }
+
+func (panickingLogHandler) Handle(context.Context, slog.Record) error {
+	panic("private panic detail")
+}
+
+func (handler panickingLogHandler) WithAttrs([]slog.Attr) slog.Handler { return handler }
+
+func (handler panickingLogHandler) WithGroup(string) slog.Handler { return handler }
+
 func (closer *countingCloser) Close() error {
 	closer.calls.Add(1)
 	return closer.err
@@ -366,6 +578,14 @@ func newListeningLogBarrier() *listeningLogBarrier {
 	}
 }
 
+func releaseListeningLog(handler *listeningLogBarrier) {
+	select {
+	case <-handler.release:
+	default:
+		close(handler.release)
+	}
+}
+
 func (handler *listeningLogBarrier) Enabled(context.Context, slog.Level) bool { return true }
 
 func (handler *listeningLogBarrier) Handle(_ context.Context, record slog.Record) error {
@@ -391,6 +611,11 @@ func (handler *listeningLogBarrier) WithGroup(string) slog.Handler { return hand
 type responseResult struct {
 	body string
 	err  error
+}
+
+type shutdownContextRequest struct {
+	parent  context.Context
+	timeout time.Duration
 }
 
 func getInBackground(url string) <-chan responseResult {
@@ -479,6 +704,15 @@ func listenLocal(t *testing.T) net.Listener {
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	require.NoError(t, err)
 	return listener
+}
+
+func requireListenerUnavailable(t *testing.T, address string) {
+	t.Helper()
+	connection, err := net.DialTimeout("tcp", address, serverTestTimeout)
+	if err == nil {
+		require.NoError(t, connection.Close())
+	}
+	require.Error(t, err, "listener still accepted connections")
 }
 
 func serveInBackground(server *Server, ctx context.Context, listener net.Listener) <-chan error {

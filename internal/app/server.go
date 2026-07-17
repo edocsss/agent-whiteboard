@@ -35,9 +35,11 @@ type Server struct {
 	closers            []io.Closer
 	configuredListener net.Listener
 	httpServer         *http.Server
+	newShutdownContext func(context.Context, time.Duration) (context.Context, context.CancelFunc)
 
 	lifecycleMu  sync.Mutex
 	started      bool
+	finished     bool
 	shuttingDown bool
 	closed       bool
 	listener     net.Listener
@@ -82,6 +84,7 @@ func NewServer(config ServerConfig) (*Server, error) {
 		closers:            append([]io.Closer(nil), config.Closers...),
 		configuredListener: config.Listener,
 		httpServer:         &http.Server{Handler: config.App.Handler()},
+		newShutdownContext: context.WithTimeout,
 		listener:           config.Listener,
 	}, nil
 }
@@ -182,11 +185,41 @@ func (s *Server) setListener(listener net.Listener) {
 func (s *Server) serveClaimed(ctx context.Context, listener net.Listener) error {
 	serveDone := make(chan error, 1)
 	go func() {
-		serveDone <- normalizeHTTPServerError(s.httpServer.Serve(listener))
+		serveErr := normalizeHTTPServerError(s.httpServer.Serve(listener))
+		s.finishServing()
+		serveDone <- serveErr
 	}()
 
 	address := listener.Addr().String()
-	s.logger.InfoContext(ctx, "server listening", "address", address, "url", "http://"+address)
+	logCtx, cancelLog := context.WithCancel(ctx)
+	defer cancelLog()
+	logDone := make(chan error, 1)
+	// Logging runs independently so cancellation and an early Serve exit cannot
+	// be hidden by a slow handler. Injected handlers that block must honor ctx;
+	// the buffered result still lets a late return finish without a goroutine leak.
+	go func() {
+		logDone <- s.logListening(logCtx, address)
+	}()
+
+	select {
+	case <-ctx.Done():
+		cancelLog()
+		return s.shutdownAfterCancellation(serveDone, nil)
+	case serveErr := <-serveDone:
+		cancelLog()
+		if ctx.Err() != nil {
+			return s.shutdownAfterCancellation(nil, serveErr)
+		}
+		if serveErr != nil {
+			return errors.Join(serveErr, s.Close())
+		}
+		return nil
+	case logErr := <-logDone:
+		if logErr != nil {
+			return errors.Join(logErr, s.shutdownAfterCancellation(serveDone, nil))
+		}
+	}
+
 	if ctx.Err() != nil {
 		return s.shutdownAfterCancellation(serveDone, nil)
 	}
@@ -199,7 +232,6 @@ func (s *Server) serveClaimed(ctx context.Context, listener net.Listener) error 
 		if ctx.Err() != nil {
 			return s.shutdownAfterCancellation(nil, serveErr)
 		}
-		s.app.SetReady(false)
 		if serveErr != nil {
 			return errors.Join(serveErr, s.Close())
 		}
@@ -207,9 +239,19 @@ func (s *Server) serveClaimed(ctx context.Context, listener net.Listener) error 
 	}
 }
 
+func (s *Server) logListening(ctx context.Context, address string) (err error) {
+	defer func() {
+		if recover() != nil {
+			err = errors.New("server listening log handler panicked")
+		}
+	}()
+	s.logger.InfoContext(ctx, "server listening", "address", address, "url", "http://"+address)
+	return nil
+}
+
 func (s *Server) shutdownAfterCancellation(serveDone <-chan error, knownServeErr error) error {
 	s.markShuttingDown()
-	shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), s.shutdownTimeout)
+	shutdownCtx, cancelShutdown := s.newShutdownContext(context.Background(), s.shutdownTimeout)
 	shutdownErr := normalizeHTTPServerError(s.httpServer.Shutdown(shutdownCtx))
 	var forceCloseErr error
 	if errors.Is(shutdownCtx.Err(), context.DeadlineExceeded) {
@@ -235,11 +277,18 @@ func (s *Server) markShuttingDown() {
 func (s *Server) markReady() bool {
 	s.lifecycleMu.Lock()
 	defer s.lifecycleMu.Unlock()
-	if s.shuttingDown || s.closed {
+	if s.finished || s.shuttingDown || s.closed {
 		return false
 	}
 	s.app.SetReady(true)
 	return true
+}
+
+func (s *Server) finishServing() {
+	s.lifecycleMu.Lock()
+	s.app.SetReady(false)
+	s.finished = true
+	s.lifecycleMu.Unlock()
 }
 
 func normalizeHTTPServerError(err error) error {
