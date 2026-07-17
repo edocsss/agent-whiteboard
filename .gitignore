@@ -19,6 +19,13 @@ profile.cov
 
 # Dependency directories (remove the comment below to include it)
 # vendor/
+node_modules/
+.pnpm-store/
+
+# Browser test output
+playwright-report/
+blob-report/
+test-results/
 
 # Go workspace file
 go.work
