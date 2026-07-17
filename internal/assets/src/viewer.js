@@ -115,6 +115,7 @@ async function renderDiagrams({ container, diagramSources, doc, resolvedTheme, g
     maxTextSize: 50_000,
     maxEdges: 500,
     theme: resolvedTheme,
+    flowchart: { htmlLabels: false },
     secure: MERMAID_SECURE_KEYS,
   });
 
@@ -131,6 +132,7 @@ async function renderDiagrams({ container, diagramSources, doc, resolvedTheme, g
     try {
       const id = `agent-whiteboard-mermaid-${generation}-${index}`;
       const result = await mermaid.render(id, source);
+      placeholder.dataset.debugRaw = result.svg;
       if (!isCurrent()) return;
       const sanitizedSVG = purifier.sanitize(result.svg, {
         USE_PROFILES: { svg: true, svgFilters: true },
