@@ -26,6 +26,8 @@ const (
 	defaultMaxImageRequestBytes int64 = 100 << 20
 )
 
+var userHomeDir = os.UserHomeDir
+
 type LogMode string
 
 const (
@@ -162,8 +164,8 @@ func resolveConfig(config Config, options []Option) (resolvedConfig, error) {
 	}
 
 	rootDir := config.RootDir
-	if rootDir == "" {
-		home, err := os.UserHomeDir()
+	if rootDir == "" && (config.WhiteboardStore == nil || config.ImageStore == nil) {
+		home, err := userHomeDir()
 		if err != nil {
 			return resolvedConfig{}, fmt.Errorf("resolve home directory: %w", err)
 		}

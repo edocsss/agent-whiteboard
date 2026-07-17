@@ -207,6 +207,9 @@ func (c *Client) validateResource(resource Resource, expectedID string) error {
 	if common.ValidateID(resource.ID) != nil || (expectedID != "" && resource.ID != expectedID) {
 		return clientInvalidResponse("server returned an invalid response")
 	}
+	if resource.Permanent != (resource.ExpiresAt == nil) {
+		return clientInvalidResponse("server returned an invalid response")
+	}
 	if _, err := c.PublicURL(resource.Path); err != nil {
 		return clientInvalidResponse("server returned an invalid response")
 	}

@@ -233,6 +233,7 @@ func TestClientWhiteboardMutationsUseExactProtocol(t *testing.T) {
 		w.WriteHeader(expect.status)
 		_ = json.NewEncoder(w).Encode(httpx.ResourceResponse{Resource: httpx.Resource{
 			ID: clientTestID, Type: "markdown", Path: httpx.PublicMarkdown + clientTestID,
+			Permanent: true,
 		}})
 	}))
 	t.Cleanup(server.Close)
@@ -294,11 +295,11 @@ func TestClientImageMutationsPreserveOrderAndExpiration(t *testing.T) {
 		}
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(expect.status)
-		resource := httpx.Resource{ID: clientTestID, Path: httpx.PublicImages + clientTestID}
+		resource := httpx.Resource{ID: clientTestID, Path: httpx.PublicImages + clientTestID, Permanent: true}
 		if expect.many {
 			_ = json.NewEncoder(w).Encode(httpx.ImagesResponse{Images: []httpx.Resource{
 				resource,
-				{ID: clientSecondTestID, Path: httpx.PublicImages + clientSecondTestID},
+				{ID: clientSecondTestID, Path: httpx.PublicImages + clientSecondTestID, Permanent: true},
 			}})
 			return
 		}
@@ -505,7 +506,7 @@ func TestClientRejectsMalformedAndOversizedResponses(t *testing.T) {
 func TestClientAcceptsResponseAtOneMiBLimit(t *testing.T) {
 	t.Parallel()
 
-	body := `{"resource":{"id":"` + clientTestID + `","path":"/whiteboards/markdown/` + clientTestID + `"}}`
+	body := `{"resource":{"id":"` + clientTestID + `","path":"/whiteboards/markdown/` + clientTestID + `","permanent":true}}`
 	body += strings.Repeat(" ", (1<<20)-len(body))
 	require.Len(t, body, 1<<20)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -526,7 +527,7 @@ func TestClientAcceptsResponseAtOneMiBLimit(t *testing.T) {
 func TestClientRejectsInvalidSuccessEnvelopesPrivately(t *testing.T) {
 	t.Parallel()
 
-	validResource := `{"id":"` + clientTestID + `","path":"/images/` + clientTestID + `"}`
+	validResource := `{"id":"` + clientTestID + `","path":"/images/` + clientTestID + `","permanent":true}`
 	tests := []struct {
 		name      string
 		operation string
@@ -535,16 +536,20 @@ func TestClientRejectsInvalidSuccessEnvelopesPrivately(t *testing.T) {
 		{name: "null envelope", operation: "create", body: `null`},
 		{name: "missing envelope", operation: "create", body: `{}`},
 		{name: "missing resource fields", operation: "create", body: `{"resource":{}}`},
-		{name: "invalid resource id", operation: "create", body: `{"resource":{"id":"private-id","path":"/images/private-id"}}`},
-		{name: "missing resource path", operation: "create", body: `{"resource":{"id":"` + clientTestID + `"}}`},
-		{name: "relative resource path", operation: "create", body: `{"resource":{"id":"` + clientTestID + `","path":"images/private"}}`},
-		{name: "cross origin resource path", operation: "create", body: `{"resource":{"id":"` + clientTestID + `","path":"https://private.test/secret"}}`},
-		{name: "traversing resource path", operation: "create", body: `{"resource":{"id":"` + clientTestID + `","path":"/images/../private"}}`},
-		{name: "update id mismatch", operation: "update", body: `{"resource":{"id":"` + clientSecondTestID + `","path":"/images/` + clientSecondTestID + `"}}`},
+		{name: "invalid resource id", operation: "create", body: `{"resource":{"id":"private-id","path":"/images/private-id","permanent":true}}`},
+		{name: "missing resource path", operation: "create", body: `{"resource":{"id":"` + clientTestID + `","permanent":true}}`},
+		{name: "relative resource path", operation: "create", body: `{"resource":{"id":"` + clientTestID + `","path":"images/private","permanent":true}}`},
+		{name: "cross origin resource path", operation: "create", body: `{"resource":{"id":"` + clientTestID + `","path":"https://private.test/secret","permanent":true}}`},
+		{name: "traversing resource path", operation: "create", body: `{"resource":{"id":"` + clientTestID + `","path":"/images/../private","permanent":true}}`},
+		{name: "create null expiration not permanent", operation: "create", body: `{"resource":{"id":"` + clientTestID + `","path":"/images/` + clientTestID + `","expires_at":null,"permanent":false}}`},
+		{name: "update expiration marked permanent", operation: "update", body: `{"resource":{"id":"` + clientTestID + `","path":"/images/` + clientTestID + `","expires_at":123,"permanent":true}}`},
+		{name: "update id mismatch", operation: "update", body: `{"resource":{"id":"` + clientSecondTestID + `","path":"/images/` + clientSecondTestID + `","permanent":true}}`},
 		{name: "nil images", operation: "images", body: `{"images":null}`},
 		{name: "wrong image cardinality", operation: "images", body: `{"images":[` + validResource + `]}`},
 		{name: "duplicate image ids", operation: "images", body: `{"images":[` + validResource + `,` + validResource + `]}`},
-		{name: "invalid image resource", operation: "images", body: `{"images":[` + validResource + `,{"id":"private","path":"/images/private"}]}`},
+		{name: "invalid image resource", operation: "images", body: `{"images":[` + validResource + `,{"id":"private","path":"/images/private","permanent":true}]}`},
+		{name: "images null expiration not permanent", operation: "images", body: `{"images":[{"id":"` + clientTestID + `","path":"/images/` + clientTestID + `","expires_at":null,"permanent":false},{"id":"` + clientSecondTestID + `","path":"/images/` + clientSecondTestID + `","expires_at":null,"permanent":true}]}`},
+		{name: "images expiration marked permanent", operation: "images", body: `{"images":[{"id":"` + clientTestID + `","path":"/images/` + clientTestID + `","expires_at":123,"permanent":true},{"id":"` + clientSecondTestID + `","path":"/images/` + clientSecondTestID + `","expires_at":null,"permanent":true}]}`},
 	}
 
 	for _, test := range tests {
@@ -563,18 +568,22 @@ func TestClientRejectsInvalidSuccessEnvelopesPrivately(t *testing.T) {
 			t.Cleanup(server.Close)
 			client := newTestClient(t, server.URL, server.Client())
 
-			var err error
+			var (
+				err       error
+				resource  httpx.Resource
+				resources []httpx.Resource
+			)
 			switch test.operation {
 			case "create":
-				_, err = client.CreateWhiteboard(context.Background(), httpx.WhiteboardMarkdown, httpx.File{
+				resource, err = client.CreateWhiteboard(context.Background(), httpx.WhiteboardMarkdown, httpx.File{
 					Name: "board.md", Reader: strings.NewReader("body"),
 				}, nil)
 			case "update":
-				_, err = client.UpdateImage(context.Background(), clientTestID, httpx.File{
+				resource, err = client.UpdateImage(context.Background(), clientTestID, httpx.File{
 					Name: "image.png", Reader: strings.NewReader("body"),
 				}, nil)
 			case "images":
-				_, err = client.CreateImages(context.Background(), []httpx.File{
+				resources, err = client.CreateImages(context.Background(), []httpx.File{
 					{Name: "one.png", Reader: strings.NewReader("one")},
 					{Name: "two.png", Reader: strings.NewReader("two")},
 				}, nil)
@@ -587,6 +596,11 @@ func TestClientRejectsInvalidSuccessEnvelopesPrivately(t *testing.T) {
 			require.Equal(t, common.CodeInternal, protocolErr.Code)
 			require.Equal(t, "server returned an invalid response", protocolErr.Message)
 			require.NotContains(t, err.Error(), "private")
+			if test.operation == "images" {
+				require.Nil(t, resources)
+			} else {
+				require.Equal(t, httpx.Resource{}, resource)
+			}
 		})
 	}
 }
@@ -629,7 +643,7 @@ func TestClientStreamsMultipartWithoutReadingFileBeforeTransport(t *testing.T) {
 			StatusCode: http.StatusCreated,
 			Header:     make(http.Header),
 			Body: io.NopCloser(strings.NewReader(
-				`{"resource":{"id":"` + clientTestID + `","path":"/whiteboards/markdown/` + clientTestID + `"}}`,
+				`{"resource":{"id":"` + clientTestID + `","path":"/whiteboards/markdown/` + clientTestID + `","permanent":true}}`,
 			)),
 			Request: request,
 		}, nil

@@ -122,6 +122,32 @@ func TestResolveConfigHonorsExplicitZerosAndJSONLogging(t *testing.T) {
 	require.IsType(t, &slog.JSONHandler{}, resolved.logger.Handler())
 }
 
+func TestNewResolvesHomeOnlyWhenFilesystemStorageIsNeeded(t *testing.T) {
+	originalUserHomeDir := userHomeDir
+	homeErr := errors.New("home unavailable")
+	homeCalls := 0
+	userHomeDir = func() (string, error) {
+		homeCalls++
+		return "", homeErr
+	}
+	t.Cleanup(func() { userHomeDir = originalUserHomeDir })
+
+	whiteboards := &recordingWhiteboardStore{}
+	images := &recordingImageStore{}
+	service, err := New(Config{WhiteboardStore: whiteboards, ImageStore: images})
+	require.NoError(t, err)
+	require.NotNil(t, service)
+	require.Zero(t, homeCalls)
+	require.NoError(t, service.Close())
+
+	customWhiteboards := &recordingWhiteboardStore{}
+	service, err = New(Config{WhiteboardStore: customWhiteboards})
+	require.Nil(t, service)
+	require.ErrorIs(t, err, homeErr)
+	require.Equal(t, 1, homeCalls)
+	require.Zero(t, customWhiteboards.close)
+}
+
 func TestNewRejectsInvalidConfigurationAndTypedNilDependencies(t *testing.T) {
 	var nilWhiteboards *recordingWhiteboardStore
 	var nilImages *recordingImageStore
