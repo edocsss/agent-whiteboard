@@ -415,10 +415,8 @@ func contextError(ctx context.Context, err error) error {
 	if err == nil {
 		return nil
 	}
-	if ctx != nil {
-		if contextErr := ctx.Err(); contextErr != nil {
-			return contextErr
-		}
+	if contextErr := ctx.Err(); contextErr != nil {
+		return contextErr
 	}
 	if errors.Is(err, context.Canceled) {
 		return context.Canceled

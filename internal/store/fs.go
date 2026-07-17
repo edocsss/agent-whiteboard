@@ -96,9 +96,6 @@ func NewFS(config Config) (*FS, error) {
 	if config.Root == "" {
 		return nil, invalidRequest("storage root is required")
 	}
-	if config.Context == nil {
-		return nil, invalidRequest("storage context is required")
-	}
 	if err := config.Context.Err(); err != nil {
 		return nil, err
 	}
@@ -1188,9 +1185,6 @@ func (fs *FS) closeHandles() error {
 }
 
 func (fs *FS) beginOperation(ctx context.Context) error {
-	if ctx == nil {
-		return invalidRequest("context is required")
-	}
 	if err := ctx.Err(); err != nil {
 		return err
 	}

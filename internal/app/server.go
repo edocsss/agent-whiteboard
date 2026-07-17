@@ -95,9 +95,6 @@ func (s *Server) Handler() http.Handler {
 }
 
 func (s *Server) ListenAndServe(ctx context.Context) error {
-	if common.IsNil(ctx) {
-		return errors.New("serve context is required")
-	}
 	if err := s.reserveServe(); err != nil {
 		return err
 	}
@@ -115,9 +112,6 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 }
 
 func (s *Server) Serve(ctx context.Context, listener net.Listener) error {
-	if common.IsNil(ctx) {
-		return errors.New("serve context is required")
-	}
 	if err := ValidateListener(listener); err != nil {
 		return err
 	}
@@ -129,9 +123,6 @@ func (s *Server) Serve(ctx context.Context, listener net.Listener) error {
 }
 
 func (s *Server) Shutdown(ctx context.Context) error {
-	if common.IsNil(ctx) {
-		return errors.New("shutdown context is required")
-	}
 	s.markShuttingDown()
 	return normalizeHTTPServerError(s.httpServer.Shutdown(ctx))
 }
