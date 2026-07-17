@@ -1,12 +1,14 @@
 package http
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
 	"mime"
 	"mime/multipart"
 	standardhttp "net/http"
+	"reflect"
 	"strconv"
 	"time"
 
@@ -54,6 +56,14 @@ type ImagesResponse struct {
 	Images []Resource `json:"images"`
 }
 
+type Readiness interface {
+	Ready(context.Context) error
+}
+
+type healthResponse struct {
+	Status string `json:"status"`
+}
+
 type MultipartFile struct {
 	FieldName string
 	Filename  string
@@ -69,6 +79,34 @@ func WriteJSON(w standardhttp.ResponseWriter, status int, value any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(value)
+}
+
+func RegisterHealth(mux *standardhttp.ServeMux, readiness Readiness) {
+	mux.HandleFunc("GET /healthz", func(w standardhttp.ResponseWriter, _ *standardhttp.Request) {
+		w.Header().Set("Cache-Control", "no-store")
+		WriteJSON(w, standardhttp.StatusOK, healthResponse{Status: "ok"})
+	})
+	mux.HandleFunc("GET /readyz", func(w standardhttp.ResponseWriter, r *standardhttp.Request) {
+		w.Header().Set("Cache-Control", "no-store")
+		if isNilReadiness(readiness) || readiness.Ready(r.Context()) != nil {
+			WriteJSON(w, standardhttp.StatusServiceUnavailable, healthResponse{Status: "unavailable"})
+			return
+		}
+		WriteJSON(w, standardhttp.StatusOK, healthResponse{Status: "ready"})
+	})
+}
+
+func isNilReadiness(readiness Readiness) bool {
+	if readiness == nil {
+		return true
+	}
+	value := reflect.ValueOf(readiness)
+	switch value.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice:
+		return value.IsNil()
+	default:
+		return false
+	}
 }
 
 func WriteError(w standardhttp.ResponseWriter, err error) {

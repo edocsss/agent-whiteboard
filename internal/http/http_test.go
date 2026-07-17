@@ -2,6 +2,7 @@ package http_test
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -18,6 +19,109 @@ import (
 	httpx "github.com/edocsss/agent-whiteboard/internal/http"
 	"github.com/stretchr/testify/require"
 )
+
+type readinessFunc func(context.Context) error
+
+func (ready readinessFunc) Ready(ctx context.Context) error {
+	return ready(ctx)
+}
+
+type pointerReadiness struct{}
+
+func (*pointerReadiness) Ready(context.Context) error {
+	return nil
+}
+
+func TestRegisterHealthServesLiveAndReadyResponses(t *testing.T) {
+	t.Parallel()
+
+	requestContext := context.WithValue(context.Background(), struct{}{}, "request context")
+	var receivedContext context.Context
+	mux := http.NewServeMux()
+	httpx.RegisterHealth(mux, readinessFunc(func(ctx context.Context) error {
+		receivedContext = ctx
+		return nil
+	}))
+
+	health := serveRequest(mux, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+	readyRequest := httptest.NewRequest(http.MethodGet, "/readyz", nil).WithContext(requestContext)
+	ready := serveRequest(mux, readyRequest)
+
+	require.Equal(t, http.StatusOK, health.Code)
+	require.Equal(t, "application/json", health.Header().Get("Content-Type"))
+	require.Equal(t, "no-store", health.Header().Get("Cache-Control"))
+	require.Equal(t, "{\"status\":\"ok\"}\n", health.Body.String())
+	require.Equal(t, http.StatusOK, ready.Code)
+	require.Equal(t, "application/json", ready.Header().Get("Content-Type"))
+	require.Equal(t, "no-store", ready.Header().Get("Cache-Control"))
+	require.Equal(t, "{\"status\":\"ready\"}\n", ready.Body.String())
+	require.Same(t, requestContext, receivedContext)
+}
+
+func TestRegisterHealthReturnsUnavailableWithoutExposingReadinessError(t *testing.T) {
+	t.Parallel()
+
+	mux := http.NewServeMux()
+	httpx.RegisterHealth(mux, readinessFunc(func(context.Context) error {
+		return errors.New("database password leaked")
+	}))
+
+	ready := serveRequest(mux, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+	health := serveRequest(mux, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+
+	require.Equal(t, http.StatusServiceUnavailable, ready.Code)
+	require.Equal(t, "application/json", ready.Header().Get("Content-Type"))
+	require.Equal(t, "no-store", ready.Header().Get("Cache-Control"))
+	require.Equal(t, "{\"status\":\"unavailable\"}\n", ready.Body.String())
+	require.NotContains(t, ready.Body.String(), "database")
+	require.Equal(t, http.StatusOK, health.Code)
+}
+
+func TestRegisterHealthTreatsNilReadinessAsUnavailable(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		readiness httpx.Readiness
+	}{
+		{name: "nil"},
+		{name: "typed nil", readiness: (*pointerReadiness)(nil)},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			mux := http.NewServeMux()
+			httpx.RegisterHealth(mux, test.readiness)
+
+			ready := serveRequest(mux, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+			health := serveRequest(mux, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+
+			require.Equal(t, http.StatusServiceUnavailable, ready.Code)
+			require.Equal(t, "{\"status\":\"unavailable\"}\n", ready.Body.String())
+			require.Equal(t, http.StatusOK, health.Code)
+		})
+	}
+}
+
+func TestRegisterHealthUsesExactGetPatterns(t *testing.T) {
+	t.Parallel()
+
+	mux := http.NewServeMux()
+	httpx.RegisterHealth(mux, readinessFunc(func(context.Context) error { return nil }))
+
+	require.Equal(t, http.StatusMethodNotAllowed, serveRequest(mux, httptest.NewRequest(http.MethodPost, "/healthz", nil)).Code)
+	require.Equal(t, http.StatusMethodNotAllowed, serveRequest(mux, httptest.NewRequest(http.MethodPost, "/readyz", nil)).Code)
+	require.Equal(t, http.StatusNotFound, serveRequest(mux, httptest.NewRequest(http.MethodGet, "/healthz/child", nil)).Code)
+	require.Equal(t, http.StatusNotFound, serveRequest(mux, httptest.NewRequest(http.MethodGet, "/readyz/child", nil)).Code)
+}
+
+func serveRequest(handler http.Handler, request *http.Request) *httptest.ResponseRecorder {
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, request)
+	return recorder
+}
 
 func TestRouteConstants(t *testing.T) {
 	require.Equal(t, "/api/v1/whiteboards/markdown", httpx.APIWhiteboardMarkdown)
