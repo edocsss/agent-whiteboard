@@ -5,26 +5,26 @@ import (
 	"io"
 	"log/slog"
 
+	"github.com/edocsss/agent-whiteboard/internal/app"
 	"github.com/edocsss/agent-whiteboard/internal/common"
-	"github.com/edocsss/agent-whiteboard/pkg/agentwb"
 	"github.com/spf13/cobra"
 )
 
 type applicationArguments struct {
-	config            agentwb.Config
+	config            app.ServiceConfig
 	port              int
 	defaultExpiration int64
 }
 
 func buildApplicationArguments(settings resolvedServerSettings, logWriter io.Writer) applicationArguments {
 	var handler slog.Handler
-	if settings.logMode == string(agentwb.LogModeJSON) {
+	if settings.logMode == string(app.LogModeJSON) {
 		handler = slog.NewJSONHandler(logWriter, nil)
 	} else {
 		handler = slog.NewTextHandler(logWriter, nil)
 	}
 	return applicationArguments{
-		config: agentwb.Config{
+		config: app.ServiceConfig{
 			RootDir:              settings.storage,
 			CleanupInterval:      settings.cleanupInterval,
 			Host:                 settings.host,
@@ -32,7 +32,7 @@ func buildApplicationArguments(settings resolvedServerSettings, logWriter io.Wri
 			MaxWhiteboardBytes:   settings.maxWhiteboardBytes,
 			MaxImageBytes:        settings.maxImageBytes,
 			MaxImageRequestBytes: settings.maxImageRequestBytes,
-			LogMode:              agentwb.LogMode(settings.logMode),
+			LogMode:              app.LogMode(settings.logMode),
 			Logger:               slog.New(handler),
 		},
 		port:              settings.port,
@@ -40,10 +40,10 @@ func buildApplicationArguments(settings resolvedServerSettings, logWriter io.Wri
 	}
 }
 
-func (arguments applicationArguments) options() []agentwb.Option {
-	return []agentwb.Option{
-		agentwb.WithPort(arguments.port),
-		agentwb.WithDefaultExpiration(arguments.defaultExpiration),
+func (arguments applicationArguments) options() []app.Option {
+	return []app.Option{
+		app.WithPort(arguments.port),
+		app.WithDefaultExpiration(arguments.defaultExpiration),
 	}
 }
 

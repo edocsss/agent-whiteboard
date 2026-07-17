@@ -16,7 +16,6 @@ import (
 	"github.com/edocsss/agent-whiteboard/internal/app"
 	"github.com/edocsss/agent-whiteboard/internal/common"
 	httpx "github.com/edocsss/agent-whiteboard/internal/http"
-	"github.com/edocsss/agent-whiteboard/pkg/agentwb"
 	"github.com/spf13/cobra"
 )
 
@@ -45,7 +44,7 @@ type Dependencies struct {
 	Stderr         io.Writer
 	Getenv         func(string) string
 	NewClient      func(httpx.ClientConfig) (Client, error)
-	NewApplication func(agentwb.Config, ...agentwb.Option) (Application, error)
+	NewApplication func(app.ServiceConfig, ...app.Option) (Application, error)
 }
 
 type rootOptions struct {

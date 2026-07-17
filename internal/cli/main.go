@@ -10,9 +10,9 @@ import (
 	"strings"
 	"syscall"
 
+	"github.com/edocsss/agent-whiteboard/internal/app"
 	"github.com/edocsss/agent-whiteboard/internal/common"
 	httpx "github.com/edocsss/agent-whiteboard/internal/http"
-	"github.com/edocsss/agent-whiteboard/pkg/agentwb"
 )
 
 const (
@@ -31,8 +31,8 @@ func Run(ctx context.Context, stdout, stderr io.Writer, getenv func(string) stri
 		NewClient: func(config httpx.ClientConfig) (Client, error) {
 			return httpx.NewClient(config)
 		},
-		NewApplication: func(config agentwb.Config, options ...agentwb.Option) (Application, error) {
-			return agentwb.New(config, options...)
+		NewApplication: func(config app.ServiceConfig, options ...app.Option) (Application, error) {
+			return app.NewService(config, options...)
 		},
 	}
 	return run(ctx, stdout, stderr, getenv, os.Args[1:], deps)

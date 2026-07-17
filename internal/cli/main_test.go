@@ -9,10 +9,10 @@ import (
 	"os"
 	"testing"
 
+	"github.com/edocsss/agent-whiteboard/internal/app"
 	"github.com/edocsss/agent-whiteboard/internal/cli/mocks"
 	"github.com/edocsss/agent-whiteboard/internal/common"
 	httpx "github.com/edocsss/agent-whiteboard/internal/http"
-	"github.com/edocsss/agent-whiteboard/pkg/agentwb"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 )
@@ -74,7 +74,7 @@ func TestRunGracefulCanceledServeReturnsZero(t *testing.T) {
 		return ctx.Err()
 	}}
 	deps := validDependencies()
-	deps.NewApplication = func(agentwb.Config, ...agentwb.Option) (Application, error) { return application, nil }
+	deps.NewApplication = func(app.ServiceConfig, ...app.Option) (Application, error) { return application, nil }
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	var stdout, stderr bytes.Buffer
@@ -99,7 +99,7 @@ func TestRunMapsTypedNilFactoryResultsToInternal(t *testing.T) {
 	t.Run("application", func(t *testing.T) {
 		var application *fakeApplication
 		deps := validDependencies()
-		deps.NewApplication = func(agentwb.Config, ...agentwb.Option) (Application, error) { return application, nil }
+		deps.NewApplication = func(app.ServiceConfig, ...app.Option) (Application, error) { return application, nil }
 		var stdout, stderr bytes.Buffer
 		code := run(context.Background(), &stdout, &stderr, mapGetenv(nil), []string{"serve"}, deps)
 		require.Equal(t, exitInternal, code)
@@ -149,7 +149,7 @@ func TestRunDoesNotHideFailuresJoinedWithCancellation(t *testing.T) {
 				return errors.Join(ctx.Err(), test.failure)
 			}}
 			deps := validDependencies()
-			deps.NewApplication = func(agentwb.Config, ...agentwb.Option) (Application, error) { return application, nil }
+			deps.NewApplication = func(app.ServiceConfig, ...app.Option) (Application, error) { return application, nil }
 			ctx, cancel := context.WithCancel(context.Background())
 			cancel()
 			var stdout, stderr bytes.Buffer

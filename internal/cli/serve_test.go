@@ -11,7 +11,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/edocsss/agent-whiteboard/pkg/agentwb"
+	"github.com/edocsss/agent-whiteboard/internal/app"
+	"github.com/edocsss/agent-whiteboard/internal/common"
 	"github.com/stretchr/testify/require"
 )
 
@@ -27,11 +28,11 @@ func TestServeBuildsExactApplicationAndOwnsLifecycle(t *testing.T) {
 	require.Equal(t, 0, arguments.port)
 	require.Equal(t, int64(0), arguments.defaultExpiration)
 	require.Len(t, arguments.options(), 2)
-	wantConfig := agentwb.Config{
+	wantConfig := app.ServiceConfig{
 		RootDir: storage, CleanupInterval: 2 * time.Minute,
 		Host: "flag.host", ShutdownTimeout: 3 * time.Second,
 		MaxWhiteboardBytes: 11, MaxImageBytes: 12, MaxImageRequestBytes: 13,
-		LogMode: agentwb.LogModeJSON,
+		LogMode: app.LogModeJSON,
 	}
 
 	contextKey := struct{}{}
@@ -42,7 +43,7 @@ func TestServeBuildsExactApplicationAndOwnsLifecycle(t *testing.T) {
 		return nil
 	}}
 	deps := validDependencies()
-	deps.NewApplication = func(config agentwb.Config, options ...agentwb.Option) (Application, error) {
+	deps.NewApplication = func(config app.ServiceConfig, options ...app.Option) (Application, error) {
 		require.NotNil(t, config.Logger)
 		config.Logger = nil
 		require.Equal(t, wantConfig, config)
@@ -64,7 +65,7 @@ func TestServeBuildsExactApplicationAndOwnsLifecycle(t *testing.T) {
 func TestServeConstructorFailureDoesNotClose(t *testing.T) {
 	constructorErr := errors.New("construct failed")
 	deps := validDependencies()
-	deps.NewApplication = func(agentwb.Config, ...agentwb.Option) (Application, error) {
+	deps.NewApplication = func(app.ServiceConfig, ...app.Option) (Application, error) {
 		return nil, constructorErr
 	}
 	root, err := NewRoot(deps)
@@ -77,7 +78,7 @@ func TestServeConstructorFailureDoesNotClose(t *testing.T) {
 func TestServeRejectsTypedNilApplication(t *testing.T) {
 	var application *fakeApplication
 	deps := validDependencies()
-	deps.NewApplication = func(agentwb.Config, ...agentwb.Option) (Application, error) {
+	deps.NewApplication = func(app.ServiceConfig, ...app.Option) (Application, error) {
 		return application, nil
 	}
 	root, err := NewRoot(deps)
@@ -85,7 +86,7 @@ func TestServeRejectsTypedNilApplication(t *testing.T) {
 	root.SetArgs([]string{"serve"})
 	require.NotPanics(t, func() { err = root.ExecuteContext(context.Background()) })
 	require.EqualError(t, err, "application factory returned nil")
-	require.False(t, agentwb.HasErrorCode(err, agentwb.CodeInvalidRequest), "error: %v", err)
+	require.False(t, common.HasCode(err, common.CodeInvalidRequest), "error: %v", err)
 }
 
 func TestServeClosesAndJoinsPostConstructionErrors(t *testing.T) {
@@ -93,7 +94,7 @@ func TestServeClosesAndJoinsPostConstructionErrors(t *testing.T) {
 	closeErr := errors.New("close failed")
 	application := &fakeApplication{listen: func(context.Context) error { return listenErr }, closeErr: closeErr}
 	deps := validDependencies()
-	deps.NewApplication = func(agentwb.Config, ...agentwb.Option) (Application, error) { return application, nil }
+	deps.NewApplication = func(app.ServiceConfig, ...app.Option) (Application, error) { return application, nil }
 	root, err := NewRoot(deps)
 	require.NoError(t, err)
 	root.SetArgs([]string{"serve"})
@@ -111,7 +112,7 @@ func TestServeCancellationIsGracefulAndCloses(t *testing.T) {
 		return fmt.Errorf("serve stopped: %w", ctx.Err())
 	}}
 	deps := validDependencies()
-	deps.NewApplication = func(agentwb.Config, ...agentwb.Option) (Application, error) { return application, nil }
+	deps.NewApplication = func(app.ServiceConfig, ...app.Option) (Application, error) { return application, nil }
 	root, err := NewRoot(deps)
 	require.NoError(t, err)
 	root.SetArgs([]string{"serve"})
@@ -133,7 +134,7 @@ func TestServeCancellationDoesNotSwallowJoinedFailure(t *testing.T) {
 		return errors.Join(fmt.Errorf("serve stopped: %w", ctx.Err()), listenErr)
 	}}
 	deps := validDependencies()
-	deps.NewApplication = func(agentwb.Config, ...agentwb.Option) (Application, error) { return application, nil }
+	deps.NewApplication = func(app.ServiceConfig, ...app.Option) (Application, error) { return application, nil }
 	root, err := NewRoot(deps)
 	require.NoError(t, err)
 	root.SetArgs([]string{"serve"})
@@ -161,7 +162,7 @@ func TestApplicationLoggerWritesOnlyConfiguredStderrMode(t *testing.T) {
 			var stdout, stderr bytes.Buffer
 			deps := validDependencies()
 			deps.Stdout, deps.Stderr = &stdout, &stderr
-			deps.NewApplication = func(config agentwb.Config, _ ...agentwb.Option) (Application, error) {
+			deps.NewApplication = func(config app.ServiceConfig, _ ...app.Option) (Application, error) {
 				config.Logger.Info("lifecycle probe", "component", "server")
 				return &fakeApplication{}, nil
 			}

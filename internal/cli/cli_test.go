@@ -10,10 +10,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/edocsss/agent-whiteboard/internal/app"
 	"github.com/edocsss/agent-whiteboard/internal/cli/mocks"
 	"github.com/edocsss/agent-whiteboard/internal/common"
 	httpx "github.com/edocsss/agent-whiteboard/internal/http"
-	"github.com/edocsss/agent-whiteboard/pkg/agentwb"
 	"github.com/spf13/cobra"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
@@ -103,7 +103,7 @@ func TestServerSettingsPrecedence(t *testing.T) {
 			wantConfig := buildApplicationArguments(test.want, io.Discard).config
 			wantConfig.Logger = nil
 			deps := Dependencies{Stdout: io.Discard, Stderr: io.Discard, Getenv: mapGetenv(test.env), NewClient: unusedClient}
-			deps.NewApplication = func(config agentwb.Config, options ...agentwb.Option) (Application, error) {
+			deps.NewApplication = func(config app.ServiceConfig, options ...app.Option) (Application, error) {
 				require.NotNil(t, config.Logger)
 				config.Logger = nil
 				require.Equal(t, wantConfig, config)
@@ -277,7 +277,7 @@ func TestInvalidServerSettings(t *testing.T) {
 
 func TestZeroServerLimitsRemainExplicit(t *testing.T) {
 	deps := validDependencies()
-	deps.NewApplication = func(config agentwb.Config, _ ...agentwb.Option) (Application, error) {
+	deps.NewApplication = func(config app.ServiceConfig, _ ...app.Option) (Application, error) {
 		require.Zero(t, config.MaxImageRequestBytes)
 		return &fakeApplication{}, nil
 	}
@@ -454,7 +454,7 @@ func unusedClient(httpx.ClientConfig) (Client, error) {
 	return nil, errors.New("client must not be created")
 }
 
-func unusedApplication(agentwb.Config, ...agentwb.Option) (Application, error) {
+func unusedApplication(app.ServiceConfig, ...app.Option) (Application, error) {
 	return nil, errors.New("application must not be created")
 }
 
