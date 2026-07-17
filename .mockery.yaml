@@ -33,6 +33,10 @@ packages:
       dir: "{{.InterfaceDir}}/mocks"
       pkgname: mocks
     interfaces:
+      Operations:
+        config:
+          filename: mock_operations.go
+          structname: MockOperations
       Store:
         config:
           filename: mock_store.go
