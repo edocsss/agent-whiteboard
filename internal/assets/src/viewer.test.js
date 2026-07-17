@@ -12,6 +12,7 @@ vi.mock("mermaid", () => ({
 import {
   DEFAULT_TITLE,
   THEME_STORAGE_KEY,
+  bootViewer,
   normalizeTheme,
   renderWhiteboard,
 } from "./viewer.js";
@@ -54,6 +55,24 @@ beforeEach(() => {
 });
 
 describe("Markdown rendering", () => {
+  test("boots from the viewer shell JSON object contract", async () => {
+    const source = "# Shell title\n\nRendered from the shell.";
+    const sourceElement = document.createElement("script");
+    sourceElement.type = "application/json";
+    sourceElement.id = "agent-whiteboard-source";
+    sourceElement.textContent = JSON.stringify({ markdown: source });
+    document.body.replaceChildren(sourceElement);
+
+    const viewer = await bootViewer(document);
+
+    const container = document.querySelector("#agent-whiteboard-content");
+    expect(container).not.toBeNull();
+    expect(container.querySelector("h1")?.textContent).toBe("Shell title");
+    expect(container.textContent).toContain("Rendered from the shell.");
+    expect(document.title).toBe("Shell title");
+    viewer.destroy();
+  });
+
   test("renders supported Markdown and task lists with real markdown-it", async () => {
     const container = document.querySelector("#viewer");
     const source = [

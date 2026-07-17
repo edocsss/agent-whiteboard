@@ -265,8 +265,11 @@ function viewerContainer(doc) {
 export async function bootViewer(doc = document) {
   const sourceElement = doc.querySelector("#agent-whiteboard-source");
   if (!sourceElement) return undefined;
-  const source = JSON.parse(sourceElement.textContent || '""');
-  return renderWhiteboard(source, { container: viewerContainer(doc), doc });
+  const payload = JSON.parse(sourceElement.textContent || "null");
+  if (payload === null || typeof payload !== "object" || Array.isArray(payload) || typeof payload.markdown !== "string") {
+    throw new TypeError("invalid whiteboard source payload");
+  }
+  return renderWhiteboard(payload.markdown, { container: viewerContainer(doc), doc });
 }
 
 function startBrowserEntry() {
