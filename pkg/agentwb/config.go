@@ -7,7 +7,6 @@ import (
 	"net"
 	"os"
 	"path/filepath"
-	"reflect"
 	"time"
 
 	"github.com/edocsss/agent-whiteboard/internal/app"
@@ -146,10 +145,10 @@ func WithViewerAssets(css, js []byte) Option {
 }
 
 func resolveConfig(config Config, options []Option) (resolvedConfig, error) {
-	if isNilValue(config.WhiteboardStore) && config.WhiteboardStore != nil {
+	if common.IsNil(config.WhiteboardStore) && config.WhiteboardStore != nil {
 		return resolvedConfig{}, invalidFacadeConfig("whiteboard store is required")
 	}
-	if isNilValue(config.ImageStore) && config.ImageStore != nil {
+	if common.IsNil(config.ImageStore) && config.ImageStore != nil {
 		return resolvedConfig{}, invalidFacadeConfig("image store is required")
 	}
 
@@ -310,9 +309,9 @@ func validateResolvedConfig(
 		return invalidFacadeConfig("max image request bytes must not be less than max image bytes")
 	case logMode != LogModeConsole && logMode != LogModeJSON:
 		return invalidFacadeConfig("invalid log mode")
-	case isNilValue(clock):
+	case common.IsNil(clock):
 		return invalidFacadeConfig("clock is required")
-	case isNilValue(ids):
+	case common.IsNil(ids):
 		return invalidFacadeConfig("id generator is required")
 	case len(viewerCSS) == 0:
 		return invalidFacadeConfig("viewer CSS is required")
@@ -325,17 +324,4 @@ func validateResolvedConfig(
 
 func invalidFacadeConfig(message string) error {
 	return common.NewError(common.CodeInvalidRequest, message, nil)
-}
-
-func isNilValue(value any) bool {
-	if value == nil {
-		return true
-	}
-	reflected := reflect.ValueOf(value)
-	switch reflected.Kind() {
-	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice:
-		return reflected.IsNil()
-	default:
-		return false
-	}
 }

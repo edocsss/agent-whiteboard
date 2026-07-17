@@ -106,7 +106,7 @@ func writeDeleteSuccess(writer io.Writer, jsonMode bool) error {
 
 func writeCommandError(stdout, stderr io.Writer, jsonMode bool, err error) {
 	_ = stdout
-	if isNilLike(stderr) {
+	if common.IsNil(stderr) {
 		stderr = io.Discard
 	}
 	err = stableCommandError(err)

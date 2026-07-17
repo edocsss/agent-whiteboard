@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"net/http"
-	"reflect"
 	"sync/atomic"
 
 	"github.com/edocsss/agent-whiteboard/internal/common"
@@ -41,7 +40,7 @@ func New(config Config) (*App, error) {
 		return nil, common.NewError(common.CodeInvalidRequest, "image handler is required", nil)
 	}
 	for _, dependency := range config.Readiness {
-		if isNilReadiness(dependency) {
+		if common.IsNil(dependency) {
 			return nil, common.NewError(common.CodeInvalidRequest, "readiness dependency is required", nil)
 		}
 	}
@@ -73,17 +72,4 @@ func (r *readiness) Ready(ctx context.Context) error {
 		}
 	}
 	return nil
-}
-
-func isNilReadiness(value Readiness) bool {
-	if value == nil {
-		return true
-	}
-	reflected := reflect.ValueOf(value)
-	switch reflected.Kind() {
-	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice:
-		return reflected.IsNil()
-	default:
-		return false
-	}
 }

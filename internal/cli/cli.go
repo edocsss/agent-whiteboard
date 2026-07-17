@@ -9,7 +9,6 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
-	"reflect"
 	"strconv"
 	"strings"
 	"time"
@@ -85,19 +84,19 @@ type commandFactory struct {
 }
 
 func NewRoot(deps Dependencies) (*cobra.Command, error) {
-	if isNilLike(deps.Stdout) {
+	if common.IsNil(deps.Stdout) {
 		return nil, invalidCommand("stdout is required")
 	}
-	if isNilLike(deps.Stderr) {
+	if common.IsNil(deps.Stderr) {
 		return nil, invalidCommand("stderr is required")
 	}
-	if isNilLike(deps.Getenv) {
+	if common.IsNil(deps.Getenv) {
 		return nil, invalidCommand("environment lookup is required")
 	}
-	if isNilLike(deps.NewClient) {
+	if common.IsNil(deps.NewClient) {
 		return nil, invalidCommand("client factory is required")
 	}
-	if isNilLike(deps.NewApplication) {
+	if common.IsNil(deps.NewApplication) {
 		return nil, invalidCommand("application factory is required")
 	}
 
@@ -139,7 +138,7 @@ func (factory commandFactory) newClient(cmd *cobra.Command) (Client, context.Con
 	if err != nil {
 		return nil, nil, nil, stableCommandError(err)
 	}
-	if isNilLike(client) {
+	if common.IsNil(client) {
 		return nil, nil, nil, errors.New("client factory returned nil")
 	}
 	ctx, cancel := context.WithTimeout(cmd.Context(), settings.timeout)
@@ -307,19 +306,6 @@ func markUsage(err error) error {
 func usageArgs(validation cobra.PositionalArgs) cobra.PositionalArgs {
 	return func(cmd *cobra.Command, args []string) error {
 		return markUsage(validation(cmd, args))
-	}
-}
-
-func isNilLike(value any) bool {
-	if value == nil {
-		return true
-	}
-	reflected := reflect.ValueOf(value)
-	switch reflected.Kind() {
-	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice:
-		return reflected.IsNil()
-	default:
-		return false
 	}
 }
 

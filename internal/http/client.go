@@ -9,7 +9,6 @@ import (
 	standardhttp "net/http"
 	"net/url"
 	"path"
-	"reflect"
 	"strconv"
 	"strings"
 
@@ -230,7 +229,7 @@ func (c *Client) doMultipart(
 		return clientInvalidRequest("multipart files are required")
 	}
 	for _, file := range files {
-		if file.Name == "" || isNilReader(file.Reader) {
+		if file.Name == "" || common.IsNil(file.Reader) {
 			return clientInvalidRequest("file name and reader are required")
 		}
 	}
@@ -410,19 +409,6 @@ func validServerOrigin(server *url.URL) bool {
 		return false
 	}
 	return server.RawPath == "" || server.RawPath == "/"
-}
-
-func isNilReader(reader io.Reader) bool {
-	if reader == nil {
-		return true
-	}
-	value := reflect.ValueOf(reader)
-	switch value.Kind() {
-	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice:
-		return value.IsNil()
-	default:
-		return false
-	}
 }
 
 func contextError(ctx context.Context, err error) error {

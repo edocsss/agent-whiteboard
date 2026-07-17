@@ -10,7 +10,6 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"reflect"
 	"regexp"
 	"strings"
 	"sync"
@@ -103,7 +102,7 @@ func NewFS(config Config) (*FS, error) {
 	if err := config.Context.Err(); err != nil {
 		return nil, err
 	}
-	if isNil(config.Clock) {
+	if common.IsNil(config.Clock) {
 		return nil, invalidRequest("storage clock is required")
 	}
 
@@ -1464,14 +1463,6 @@ func writeAll(file *os.File, content []byte) error {
 
 func escapesRoot(relative string) bool {
 	return relative == ".." || filepath.IsAbs(relative) || strings.HasPrefix(relative, ".."+string(filepath.Separator))
-}
-
-func isNil(value any) bool {
-	if value == nil {
-		return true
-	}
-	kind := reflect.ValueOf(value).Kind()
-	return (kind == reflect.Chan || kind == reflect.Func || kind == reflect.Interface || kind == reflect.Map || kind == reflect.Pointer || kind == reflect.Slice) && reflect.ValueOf(value).IsNil()
 }
 
 func invalidRequest(message string) error {

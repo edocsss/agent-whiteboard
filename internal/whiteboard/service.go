@@ -3,7 +3,6 @@ package whiteboard
 import (
 	"context"
 	"errors"
-	"reflect"
 
 	"github.com/edocsss/agent-whiteboard/internal/common"
 )
@@ -19,11 +18,11 @@ type Service struct {
 
 func NewService(store Store, clock common.Clock, ids common.IDGenerator, defaultExpiration int64) (*Service, error) {
 	switch {
-	case isNilDependency(store):
+	case common.IsNil(store):
 		return nil, common.NewError(common.CodeInvalidRequest, "store is required", nil)
-	case isNilDependency(clock):
+	case common.IsNil(clock):
 		return nil, common.NewError(common.CodeInvalidRequest, "clock is required", nil)
-	case isNilDependency(ids):
+	case common.IsNil(ids):
 		return nil, common.NewError(common.CodeInvalidRequest, "id generator is required", nil)
 	case defaultExpiration < 0:
 		return nil, common.NewError(common.CodeInvalidRequest, "default expiration must not be negative", nil)
@@ -187,17 +186,4 @@ func normalizeNotFound(err error) error {
 
 func notFound() error {
 	return common.NewError(common.CodeNotFound, "resource not found", nil)
-}
-
-func isNilDependency(value any) bool {
-	if value == nil {
-		return true
-	}
-	reflected := reflect.ValueOf(value)
-	switch reflected.Kind() {
-	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice:
-		return reflected.IsNil()
-	default:
-		return false
-	}
 }

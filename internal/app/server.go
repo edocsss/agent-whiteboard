@@ -9,11 +9,12 @@ import (
 	"net"
 	"net/http"
 	"net/netip"
-	"reflect"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/edocsss/agent-whiteboard/internal/common"
 )
 
 type ServerConfig struct {
@@ -65,7 +66,7 @@ func NewServer(config ServerConfig) (*Server, error) {
 		return nil, errors.New("server shutdown timeout must be positive")
 	}
 	for _, closer := range config.Closers {
-		if isNilInterface(closer) {
+		if common.IsNil(closer) {
 			return nil, errors.New("server closer is required")
 		}
 	}
@@ -94,7 +95,7 @@ func (s *Server) Handler() http.Handler {
 }
 
 func (s *Server) ListenAndServe(ctx context.Context) error {
-	if isNilInterface(ctx) {
+	if common.IsNil(ctx) {
 		return errors.New("serve context is required")
 	}
 	if err := s.reserveServe(); err != nil {
@@ -114,7 +115,7 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 }
 
 func (s *Server) Serve(ctx context.Context, listener net.Listener) error {
-	if isNilInterface(ctx) {
+	if common.IsNil(ctx) {
 		return errors.New("serve context is required")
 	}
 	if err := ValidateListener(listener); err != nil {
@@ -128,7 +129,7 @@ func (s *Server) Serve(ctx context.Context, listener net.Listener) error {
 }
 
 func (s *Server) Shutdown(ctx context.Context) error {
-	if isNilInterface(ctx) {
+	if common.IsNil(ctx) {
 		return errors.New("shutdown context is required")
 	}
 	s.markShuttingDown()
@@ -301,10 +302,10 @@ func normalizeHTTPServerError(err error) error {
 
 // ValidateListener reports whether listener and its address can be used by a Server.
 func ValidateListener(listener net.Listener) error {
-	if isNilInterface(listener) {
+	if common.IsNil(listener) {
 		return errors.New("listener is required")
 	}
-	if isNilInterface(listener.Addr()) {
+	if common.IsNil(listener.Addr()) {
 		return errors.New("listener address is required")
 	}
 	return nil
@@ -335,17 +336,4 @@ func ValidServerHost(host string) bool {
 		}
 	}
 	return true
-}
-
-func isNilInterface(value any) bool {
-	if value == nil {
-		return true
-	}
-	reflected := reflect.ValueOf(value)
-	switch reflected.Kind() {
-	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice:
-		return reflected.IsNil()
-	default:
-		return false
-	}
 }

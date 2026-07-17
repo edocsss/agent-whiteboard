@@ -29,7 +29,7 @@ type Handler struct {
 
 func NewHandler(operations Operations, config HandlerConfig) (*Handler, error) {
 	switch {
-	case isNilDependency(operations):
+	case common.IsNil(operations):
 		return nil, common.NewError(common.CodeInvalidRequest, "operations are required", nil)
 	case config.MaxImageBytes < 0:
 		return nil, common.NewError(common.CodeInvalidRequest, "max image bytes must not be negative", nil)

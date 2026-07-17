@@ -8,7 +8,6 @@ import (
 	"mime"
 	"mime/multipart"
 	standardhttp "net/http"
-	"reflect"
 	"strconv"
 	"time"
 
@@ -98,25 +97,12 @@ func RegisterHealth(mux *standardhttp.ServeMux, readiness Readiness) {
 			return
 		}
 		w.Header().Set("Cache-Control", "no-store")
-		if isNilReadiness(readiness) || readiness.Ready(r.Context()) != nil {
+		if common.IsNil(readiness) || readiness.Ready(r.Context()) != nil {
 			WriteJSON(w, standardhttp.StatusServiceUnavailable, healthResponse{Status: "unavailable"})
 			return
 		}
 		WriteJSON(w, standardhttp.StatusOK, healthResponse{Status: "ready"})
 	})
-}
-
-func isNilReadiness(readiness Readiness) bool {
-	if readiness == nil {
-		return true
-	}
-	value := reflect.ValueOf(readiness)
-	switch value.Kind() {
-	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice:
-		return value.IsNil()
-	default:
-		return false
-	}
 }
 
 func WriteError(w standardhttp.ResponseWriter, err error) {

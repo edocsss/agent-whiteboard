@@ -5,6 +5,7 @@ import (
 	"io"
 	"log/slog"
 
+	"github.com/edocsss/agent-whiteboard/internal/common"
 	"github.com/edocsss/agent-whiteboard/pkg/agentwb"
 	"github.com/spf13/cobra"
 )
@@ -79,7 +80,7 @@ func (factory commandFactory) runServe(cmd *cobra.Command, values *serverFlagVal
 	if err != nil {
 		return err
 	}
-	if isNilLike(application) {
+	if common.IsNil(application) {
 		return errors.New("application factory returned nil")
 	}
 	defer func() {

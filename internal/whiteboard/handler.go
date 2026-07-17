@@ -28,7 +28,7 @@ type Handler struct {
 
 func NewHandler(operations Operations, viewer *Viewer, config HandlerConfig) (*Handler, error) {
 	switch {
-	case isNilDependency(operations):
+	case common.IsNil(operations):
 		return nil, common.NewError(common.CodeInvalidRequest, "operations are required", nil)
 	case viewer == nil:
 		return nil, common.NewError(common.CodeInvalidRequest, "viewer is required", nil)
