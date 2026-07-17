@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"os"
@@ -20,8 +21,9 @@ import (
 )
 
 const (
-	processTimeout = 10 * time.Second
-	pollInterval   = 20 * time.Millisecond
+	processTimeout     = 10 * time.Second
+	integrationTimeout = 10 * time.Second
+	pollInterval       = 20 * time.Millisecond
 )
 
 var binaryPath string
@@ -83,6 +85,31 @@ type serverLog struct {
 	Message string `json:"msg"`
 	Address string `json:"address"`
 	URL     string `json:"url"`
+}
+
+type cliResource struct {
+	ID        string `json:"id"`
+	URL       string `json:"url"`
+	ExpiresAt *int64 `json:"expires_at"`
+	Permanent bool   `json:"permanent"`
+}
+
+type cliResourceEnvelope struct {
+	SchemaVersion int         `json:"schema_version"`
+	Resource      cliResource `json:"resource"`
+}
+
+type cliResourcesEnvelope struct {
+	SchemaVersion int           `json:"schema_version"`
+	Resources     []cliResource `json:"resources"`
+}
+
+type cliErrorEnvelope struct {
+	SchemaVersion int `json:"schema_version"`
+	Error         struct {
+		Code    string `json:"code"`
+		Message string `json:"message"`
+	} `json:"error"`
 }
 
 type serverLogWriter struct {
@@ -298,6 +325,75 @@ func requireUnavailable(t *testing.T, endpoint string) {
 		case <-timer.C:
 		}
 	}
+}
+
+func writeFixture(t *testing.T, name string, content []byte) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), name)
+	require.NoError(t, os.WriteFile(path, content, 0o600))
+	return path
+}
+
+func fetch(t *testing.T, endpoint string) (*http.Response, string) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), integrationTimeout)
+	defer cancel()
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	require.NoError(t, err)
+	response, err := (&http.Client{Timeout: integrationTimeout}).Do(request)
+	require.NoError(t, err)
+	body, err := io.ReadAll(response.Body)
+	require.NoError(t, err)
+	require.NoError(t, response.Body.Close())
+	return response, string(body)
+}
+
+func runCLIResource(t *testing.T, server *testServer, args ...string) cliResourceEnvelope {
+	t.Helper()
+	stdout := runCLISuccess(t, server, args...)
+	var envelope cliResourceEnvelope
+	require.NoError(t, json.Unmarshal([]byte(stdout), &envelope), stdout)
+	return envelope
+}
+
+func runCLISuccess(t *testing.T, server *testServer, args ...string) string {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), integrationTimeout)
+	defer cancel()
+	stdout, stderr, err := server.RunCLI(ctx, args...)
+	require.NoError(t, err, "stderr: %s", stderr)
+	require.Empty(t, stderr)
+	return stdout
+}
+
+func runCLIDelete(t *testing.T, server *testServer, args ...string) {
+	t.Helper()
+	stdout := runCLISuccess(t, server, args...)
+	require.JSONEq(t, `{"schema_version":1}`, stdout)
+}
+
+func requireJSONError(t *testing.T, value, code string) cliErrorEnvelope {
+	t.Helper()
+	var envelope cliErrorEnvelope
+	require.NoError(t, json.Unmarshal([]byte(value), &envelope), value)
+	require.Equal(t, 1, envelope.SchemaVersion)
+	require.Equal(t, code, envelope.Error.Code)
+	require.NotEmpty(t, envelope.Error.Message)
+	return envelope
+}
+
+func mustJSON(t *testing.T, value any) []byte {
+	t.Helper()
+	encoded, err := json.Marshal(value)
+	require.NoError(t, err)
+	return encoded
+}
+
+func requireCategoryEmpty(t *testing.T, root, category string) {
+	t.Helper()
+	entries, err := os.ReadDir(filepath.Join(root, category))
+	require.NoError(t, err)
+	require.Empty(t, entries)
 }
 
 func (s *testServer) RunCLI(ctx context.Context, args ...string) (string, string, error) {
