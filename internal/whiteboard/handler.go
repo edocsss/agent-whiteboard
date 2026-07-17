@@ -20,8 +20,6 @@ type HandlerConfig struct {
 	MaxBytes int64
 }
 
-type Viewer struct{}
-
 type Handler struct {
 	operations Operations
 	viewer     *Viewer
@@ -52,6 +50,46 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("POST "+httpx.APIWhiteboardHTML, h.createHTML)
 	mux.HandleFunc("PUT "+httpx.APIWhiteboardHTML+"/{id}", h.updateHTML)
 	mux.HandleFunc("DELETE "+httpx.APIWhiteboardHTML+"/{id}", h.deleteHTML)
+	mux.HandleFunc("GET "+httpx.PublicMarkdown+"{id}", h.viewMarkdown)
+	mux.HandleFunc("GET "+httpx.PublicHTML+"{id}", h.viewHTML)
+}
+
+func (h *Handler) viewMarkdown(w http.ResponseWriter, r *http.Request) {
+	h.view(w, r, KindMarkdown)
+}
+
+func (h *Handler) viewHTML(w http.ResponseWriter, r *http.Request) {
+	h.view(w, r, KindHTML)
+}
+
+func (h *Handler) view(w http.ResponseWriter, r *http.Request, kind Kind) {
+	httpx.SetPublicHeaders(w, false)
+	id := r.PathValue("id")
+	if err := common.ValidateID(id); err != nil {
+		httpx.WriteError(w, notFound())
+		return
+	}
+
+	board, err := h.operations.Get(r.Context(), id)
+	if err != nil {
+		if common.HasCode(err, common.CodeNotFound) {
+			err = notFound()
+		}
+		httpx.WriteError(w, err)
+		return
+	}
+	if board.Kind != kind {
+		httpx.WriteError(w, notFound())
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	if kind == KindMarkdown {
+		_ = h.viewer.Render(w, board)
+		return
+	}
+	_, _ = w.Write(board.Source)
 }
 
 func (h *Handler) createMarkdown(w http.ResponseWriter, r *http.Request) {
